@@ -6,4 +6,4 @@ GlacierDesk is in the planning stage. See [PLAN.md](PLAN.md) for the proposed fe
 
 ## Copyright and license
 
-Copyright © 2026 willislabs.ai. An open-source license is planned but has not yet been selected. Until a license is added, no open-source license is granted.
+Copyright © 2026 WillisLabs.ai. Licensed under the [Apache License, Version 2.0](LICENSE).
