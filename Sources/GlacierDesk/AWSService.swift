@@ -65,9 +65,28 @@ public struct AWSService: Sendable {
     }
 
     public func upload(fileURL: URL, bucket: String, key: String,
-                       storageClass: String = "STANDARD") async throws {
+                       storageClass: String = "STANDARD", settings: UploadSettings = .init()) async throws {
+        try settings.validate()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = directory.appendingPathComponent("config")
+        let original = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".aws/config")
+        if FileManager.default.fileExists(atPath: original.path) {
+            try FileManager.default.copyItem(at: original, to: config)
+        } else {
+            try Data().write(to: config, options: .atomic)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: config.path)
+        let overrides = ["AWS_CONFIG_FILE": config.path]
+        for (name, value) in [("multipart_threshold", settings.thresholdMiB), ("multipart_chunksize", settings.partSizeMiB), ("max_concurrent_requests", settings.connections)] {
+            let configured = name == "max_concurrent_requests" ? "\(value)" : "\(value * 1_048_576)"
+            _ = try await run(["configure", "set", "s3.\(name)", configured, "--profile", profile], environmentOverrides: overrides)
+        }
+        // The CRT transfer client can ignore these settings; force the classic client.
+        _ = try await run(["configure", "set", "s3.preferred_transfer_client", "classic", "--profile", profile], environmentOverrides: overrides)
         _ = try await run(["s3", "cp", fileURL.path, "s3://\(bucket)/\(key)",
-                           "--storage-class", storageClass, "--only-show-errors"])
+                           "--storage-class", storageClass, "--only-show-errors"], environmentOverrides: overrides)
     }
 
     public func download(bucket: String, key: String, to fileURL: URL) async throws {
@@ -107,7 +126,7 @@ public struct AWSService: Sendable {
         return decoder
     }
 
-    private func run(_ arguments: [String]) async throws -> CommandResult {
+    private func run(_ arguments: [String], environmentOverrides: [String: String] = [:]) async throws -> CommandResult {
         var command = ["--profile", profile, "--no-cli-pager", "--output", "json"] + arguments
         // `configure list-profiles` does not accept output formatting options.
         if arguments.first == "configure" { command = arguments }
@@ -122,6 +141,7 @@ public struct AWSService: Sendable {
             environment["AWS_PROFILE"] = profile
             environment["AWS_CLI_AUTO_PROMPT"] = "off"
             environment["AWS_PAGER"] = ""
+            environment.merge(environmentOverrides) { _, new in new }
             process.environment = environment
             let stdout = Pipe(), stderr = Pipe()
             process.standardOutput = stdout
@@ -150,6 +170,19 @@ public struct AWSService: Sendable {
         ]
         return patterns.reduce(message) { value, pattern in
             value.replacingOccurrences(of: pattern, with: "[REDACTED]", options: .regularExpression)
+        }
+    }
+}
+
+public struct UploadSettings: Sendable {
+    public init() {}
+    public var thresholdMiB = 64
+    public var partSizeMiB = 16
+    public var connections = 4
+
+    public func validate() throws {
+        guard (1...5120).contains(thresholdMiB), (5...5120).contains(partSizeMiB), (1...32).contains(connections) else {
+            throw AWSServiceError.commandFailed("Upload settings are outside their allowed range.")
         }
     }
 }

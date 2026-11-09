@@ -12,6 +12,8 @@ Run `bash scripts/build-app.sh` from the project directory, then open `dist/Glac
 
 This early checkpoint uses the locally installed AWS CLI and your existing AWS configuration. AWS operations can incur charges. Use a dedicated test account and bucket when evaluating the app.
 
+Use the sliders button in the toolbar to configure the multipart upload threshold, part size, and maximum parallel requests. Settings apply to new uploads; files below the threshold use a single upload. The AWS CLI may increase part size to satisfy S3 limits. GlacierDesk uses a temporary private copy of the AWS config for these settings and leaves the original unchanged. Interrupted multipart uploads can leave billable parts in S3; configure an S3 lifecycle rule to abort incomplete multipart uploads.
+
 ## Set up an AWS profile
 
 GlacierDesk uses AWS CLI named profiles. Install [AWS CLI version 2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), then check that `aws --version` works in Terminal. You need an AWS identity with permissions for the S3 buckets and actions you intend to use; ask your AWS administrator if you do not have one.

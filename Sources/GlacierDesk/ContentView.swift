@@ -22,6 +22,9 @@ final class GlacierDeskModel: ObservableObject {
     @Published var storageClass = "STANDARD"
     @Published var restoreTier: RestoreTier = .standard
     @Published var connectedProfile: String?
+    @AppStorage("uploadThresholdMiB") var uploadThresholdMiB = 64
+    @AppStorage("uploadPartSizeMiB") var uploadPartSizeMiB = 16
+    @AppStorage("uploadConnections") var uploadConnections = 4
 
     private var service: AWSService? {
         let profile = connectedProfile ?? selectedProfile
@@ -96,8 +99,12 @@ final class GlacierDeskModel: ObservableObject {
         isBusy = true
         defer { isBusy = false }
         do {
+            var settings = UploadSettings()
+            settings.thresholdMiB = uploadThresholdMiB
+            settings.partSizeMiB = uploadPartSizeMiB
+            settings.connections = uploadConnections
             try await service.upload(fileURL: url, bucket: bucket.name,
-                                     key: prefix + url.lastPathComponent, storageClass: storageClass)
+                                     key: prefix + url.lastPathComponent, storageClass: storageClass, settings: settings)
             activity.insert("Uploaded \(url.lastPathComponent) to \(bucket.name)", at: 0)
             notice = "Upload complete."
             await loadPage(reset: true)
@@ -136,6 +143,7 @@ struct ContentView: View {
     @State private var showUploadConfirmation = false
     @State private var showRestoreConfirmation = false
     @State private var selectedSection = "Browse"
+    @State private var showTransferSettings = false
 
     var body: some View {
         NavigationSplitView {
@@ -276,6 +284,19 @@ struct ContentView: View {
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            Button { showTransferSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
+                .help("Upload settings")
+                .disabled(model.isBusy)
+                .popover(isPresented: $showTransferSettings) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("Upload settings").font(.headline)
+                        Stepper("Multipart threshold: \(model.uploadThresholdMiB) MiB", value: $model.uploadThresholdMiB, in: 1...5120)
+                        Stepper("Part size: \(model.uploadPartSizeMiB) MiB", value: $model.uploadPartSizeMiB, in: 5...5120)
+                        Stepper("Parallel requests: \(model.uploadConnections)", value: $model.uploadConnections, in: 1...32)
+                        Text("Files above the threshold use multipart upload. AWS may increase the part size for very large files. Settings apply to new uploads.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }.padding(18).frame(width: 340)
+                }
             if model.selectedBucket != nil {
                 Picker("Storage class", selection: $model.storageClass) {
                     Text("Standard").tag("STANDARD")
