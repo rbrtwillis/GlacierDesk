@@ -1,6 +1,16 @@
 import AppKit
 import SwiftUI
 
+struct RestoreRecord: Codable, Identifiable {
+    var id = UUID()
+    var profile: String
+    var account: String
+    var bucket: String
+    var key: String
+    var requested: Date
+    var status: String
+}
+
 @MainActor
 final class GlacierDeskModel: ObservableObject {
     @Published var profiles: [String] = []
@@ -22,6 +32,12 @@ final class GlacierDeskModel: ObservableObject {
     @Published var storageClass = "STANDARD"
     @Published var restoreTier: RestoreTier = .standard
     @Published var connectedProfile: String?
+    @Published var restores: [RestoreRecord] = []
+    @Published var transferProgress: Double?
+    @Published var transferStatus: String?
+    private var transferTask: Task<Void, Never>?
+    private var retryTransfer: (() -> Void)?
+    @AppStorage("restoreRecords") private var restoreData = Data()
     @AppStorage("uploadThresholdMiB") var uploadThresholdMiB = 64
     @AppStorage("uploadPartSizeMiB") var uploadPartSizeMiB = 16
     @AppStorage("uploadConnections") var uploadConnections = 4
@@ -31,7 +47,44 @@ final class GlacierDeskModel: ObservableObject {
         return profile.isEmpty ? nil : AWSService(profile: profile)
     }
 
+    func loadRestores() { restores = (try? JSONDecoder().decode([RestoreRecord].self, from: restoreData)) ?? [] }
+    private func saveRestores() { if let data = try? JSONEncoder().encode(restores) { restoreData = data } }
+
+    func refreshRestores() async {
+        guard let service, let account = identity?.account, let profile = connectedProfile else { return }
+        for record in restores where record.account == account && record.profile == profile {
+            do {
+                let metadata = try await service.headObject(bucket: record.bucket, key: record.key)
+                if let index = restores.firstIndex(where: { $0.id == record.id }) {
+                    restores[index].status = metadata.restore ?? "Archived or restore expired"
+                }
+            } catch {
+                if let index = restores.firstIndex(where: { $0.id == record.id }) { restores[index].status = "Refresh failed: \(error.localizedDescription)" }
+            }
+        }
+        saveRestores()
+    }
+
+    func cancelTransfer() { transferTask?.cancel(); transferStatus = "Cancelling…" }
+    func retryLastTransfer() { retryTransfer?() }
+    var canRetryTransfer: Bool { transferTask == nil && retryTransfer != nil }
+    func startUpload(_ url: URL) {
+        guard transferTask == nil else { return }
+        retryTransfer = { [weak self] in self?.startUpload(url) }
+        transferTask = Task {
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() }; transferTask = nil }
+            await upload(url)
+        }
+    }
+    func startDownload(_ object: AWSObject, to destination: URL) {
+        guard transferTask == nil else { return }
+        retryTransfer = { [weak self] in self?.startDownload(object, to: destination) }
+        transferTask = Task { defer { transferTask = nil }; await download(object, to: destination) }
+    }
+
     func disconnect() {
+        retryTransfer = nil
         identity = nil; connectedProfile = nil; buckets = []; selectedBucket = nil
         objects = []; prefixes = []; selectedObject = nil; metadata = nil; prefix = ""
     }
@@ -49,6 +102,7 @@ final class GlacierDeskModel: ObservableObject {
 
     func connect() async {
         guard let service else { return }
+        retryTransfer = nil
         isBusy = true; errorMessage = nil; identity = nil; connectedProfile = nil; buckets = []; selectedBucket = nil
         defer { isBusy = false }
         do {
@@ -57,15 +111,18 @@ final class GlacierDeskModel: ObservableObject {
             connectedProfile = selectedProfile
             buckets = try await service.listBuckets()
             activity.insert("Connected as \(who.arn)", at: 0)
+            await refreshRestores()
         } catch { errorMessage = error.localizedDescription }
     }
 
     func openBucket(_ bucket: AWSBucket) async {
+        retryTransfer = nil
         selectedBucket = bucket; prefix = ""; continuationToken = nil; objects = []; prefixes = []; selectedObject = nil
         await loadPage(reset: true)
     }
 
     func openPrefix(_ value: String) async {
+        retryTransfer = nil
         prefix = value; continuationToken = nil; objects = []; prefixes = []; selectedObject = nil
         await loadPage(reset: true)
     }
@@ -97,6 +154,7 @@ final class GlacierDeskModel: ObservableObject {
     func upload(_ url: URL) async {
         guard let service, let bucket = selectedBucket else { return }
         isBusy = true
+        transferStatus = "Uploading \(url.lastPathComponent)"; transferProgress = 0
         defer { isBusy = false }
         do {
             var settings = UploadSettings()
@@ -104,21 +162,26 @@ final class GlacierDeskModel: ObservableObject {
             settings.partSizeMiB = uploadPartSizeMiB
             settings.connections = uploadConnections
             try await service.upload(fileURL: url, bucket: bucket.name,
-                                     key: prefix + url.lastPathComponent, storageClass: storageClass, settings: settings)
+                                     key: prefix + url.lastPathComponent, storageClass: storageClass, settings: settings,
+                                     progress: { [weak self] value in Task { @MainActor in self?.transferProgress = value } })
             activity.insert("Uploaded \(url.lastPathComponent) to \(bucket.name)", at: 0)
+            transferStatus = "Upload complete"; transferProgress = 1; retryTransfer = nil
             notice = "Upload complete."
             await loadPage(reset: true)
-        } catch { errorMessage = error.localizedDescription }
+        } catch { transferStatus = Task.isCancelled ? "Upload cancelled; incomplete parts may remain in S3." : "Upload failed: \(error.localizedDescription)" }
     }
 
     func download(_ object: AWSObject, to destination: URL) async {
         guard let service, let bucket = selectedBucket else { return }
         isBusy = true
+        transferStatus = "Downloading \(object.key)"; transferProgress = 0
         defer { isBusy = false }
         do {
-            try await service.download(bucket: bucket.name, key: object.key, to: destination)
+            try await service.download(bucket: bucket.name, key: object.key, to: destination,
+                                       progress: { [weak self] value in Task { @MainActor in self?.transferProgress = value } })
+            transferStatus = "Download complete"; transferProgress = 1; retryTransfer = nil
             activity.insert("Downloaded \(object.key)", at: 0); notice = "Download complete."
-        } catch { errorMessage = error.localizedDescription }
+        } catch { transferStatus = Task.isCancelled ? "Download cancelled" : "Download failed: \(error.localizedDescription)" }
     }
 
     func restore(_ object: AWSObject) async {
@@ -127,6 +190,11 @@ final class GlacierDeskModel: ObservableObject {
         defer { isBusy = false }
         do {
             try await service.restore(bucket: bucket.name, key: object.key, days: 3, tier: restoreTier)
+            if let account = identity?.account, let profile = connectedProfile {
+                restores.removeAll { $0.account == account && $0.bucket == bucket.name && $0.key == object.key }
+                restores.insert(RestoreRecord(profile: profile, account: account, bucket: bucket.name, key: object.key, requested: Date(), status: "Restore requested; awaiting AWS status"), at: 0)
+                saveRestores()
+            }
             activity.insert("Restore requested for \(object.key) (\(restoreTier.rawValue))", at: 0)
             notice = "Restore request submitted. Refresh object details to check its status. AWS retrieval and temporary-copy charges may apply."
             await inspect(object)
@@ -152,6 +220,7 @@ struct ContentView: View {
             Group {
                 switch selectedSection {
                 case "Activity": activityView
+                case "Restores": restoresView
                 default: browser
                 }
             }
@@ -160,7 +229,15 @@ struct ContentView: View {
         }
         .toolbar { toolbar }
         .tint(GlacierTheme.accent)
-        .task { await model.loadProfiles() }
+        .task {
+            model.loadRestores()
+            await model.loadProfiles()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard !Task.isCancelled else { break }
+                await model.refreshRestores()
+            }
+        }
         .fileImporter(isPresented: $showUpload, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
             if case .success(let urls) = result, let url = urls.first {
                 uploadURLAccess = url.startAccessingSecurityScopedResource()
@@ -174,12 +251,10 @@ struct ContentView: View {
         .confirmationDialog("Upload to S3?", isPresented: $showUploadConfirmation, titleVisibility: .visible) {
             Button("Upload \(pendingUploadURL?.lastPathComponent ?? "file")") {
                 guard let url = pendingUploadURL else { return }
-                Task {
-                    await model.upload(url)
-                    if uploadURLAccess { url.stopAccessingSecurityScopedResource() }
-                    uploadURLAccess = false
-                    pendingUploadURL = nil
-                }
+                model.startUpload(url)
+                if uploadURLAccess { url.stopAccessingSecurityScopedResource() }
+                uploadURLAccess = false
+                pendingUploadURL = nil
             }
             Button("Cancel", role: .cancel) {
                 if let url = pendingUploadURL, uploadURLAccess { url.stopAccessingSecurityScopedResource() }
@@ -247,7 +322,8 @@ struct ContentView: View {
             List(selection: $selectedSection) {
                 Label("Browse", systemImage: "externaldrive").tag("Browse")
                 Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
-            }.listStyle(.sidebar).frame(minHeight: 90, maxHeight: 130)
+                Label("Restores", systemImage: "archivebox").tag("Restores")
+            }.listStyle(.sidebar).frame(minHeight: 120, maxHeight: 160)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack { Text("BUCKETS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
@@ -268,7 +344,7 @@ struct ContentView: View {
                                         if model.selectedBucket?.id == bucket.id { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary) }
                                     }.font(.callout).padding(.vertical, 7).padding(.horizontal, 8)
                                         .background(model.selectedBucket?.id == bucket.id ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
-                                }.buttonStyle(.plain)
+                                }.buttonStyle(.plain).disabled(model.isBusy)
                             }
                         }
                     }
@@ -447,10 +523,43 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Activity").font(.title2.weight(.semibold)).padding(20)
             Divider()
+            if let status = model.transferStatus {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(status).textSelection(.enabled)
+                    if let progress = model.transferProgress { ProgressView(value: progress) }
+                    HStack {
+                        if model.isBusy { Button("Cancel transfer") { model.cancelTransfer() } }
+                        if model.canRetryTransfer { Button("Retry transfer") { model.retryLastTransfer() } }
+                    }
+                }.padding(16)
+                Divider()
+            }
             if model.activity.isEmpty {
                 EmptyState(title: "No activity yet", icon: "clock.arrow.circlepath", detail: "Uploads, downloads, and restore requests will appear here.")
             } else {
                 List(model.activity, id: \.self) { item in Label(item, systemImage: "checkmark.circle").padding(.vertical, 5) }.listStyle(.plain)
+            }
+        }
+    }
+
+    private var restoresView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Restores").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Refresh") { Task { await model.refreshRestores() } }.disabled(model.identity == nil)
+            }.padding(20)
+            Divider()
+            if model.restores.isEmpty {
+                EmptyState(title: "No restore requests", icon: "archivebox", detail: "Requests made in GlacierDesk appear here and are refreshed when connected.")
+            } else {
+                List(model.restores) { record in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("\(record.bucket) / \(record.key)").font(.headline).textSelection(.enabled)
+                        Text("Account \(record.account) · \(record.profile) · requested \(record.requested.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary)
+                        Text(record.status).font(.caption).textSelection(.enabled)
+                    }.padding(.vertical, 5)
+                }.listStyle(.plain)
             }
         }
     }
@@ -478,7 +587,7 @@ struct ContentView: View {
         panel.nameFieldStringValue = URL(fileURLWithPath: object.key).lastPathComponent
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await model.download(object, to: url) }
+        model.startDownload(object, to: url)
     }
     private func availableRestoreTiers(for object: AWSObject?) -> [RestoreTier] {
         object?.storageClass?.uppercased() == "DEEP_ARCHIVE" ? [.standard, .bulk] : RestoreTier.allCases

@@ -14,6 +14,10 @@ This early checkpoint uses the locally installed AWS CLI and your existing AWS c
 
 Use the sliders button in the toolbar to configure the multipart upload threshold, part size, and maximum parallel requests. Settings apply to new uploads; files below the threshold use a single upload. The AWS CLI may increase part size to satisfy S3 limits. GlacierDesk uses a temporary private copy of the AWS config for these settings and leaves the original unchanged. Interrupted multipart uploads can leave billable parts in S3; configure an S3 lifecycle rule to abort incomplete multipart uploads.
 
+The Activity view shows transfer progress and offers cancellation and retry. Retry starts the transfer again; it does not resume individual multipart parts. Downloads use a temporary file and replace the destination only after a successful transfer. Transfers and retry actions do not survive an app restart.
+
+The Restores view saves requests made in GlacierDesk on this Mac and refreshes their S3 status when you connect and approximately once a minute while the app is open. Connect to the same profile and account to refresh a request. The S3 restore response includes an expiry date when a temporary copy is available. Requests initiated elsewhere are not automatically added to this list. If the app exits before a restore response is received, inspect the object in S3 before submitting another request.
+
 ## Set up an AWS profile
 
 GlacierDesk uses AWS CLI named profiles. Install [AWS CLI version 2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), then check that `aws --version` works in Terminal. You need an AWS identity with permissions for the S3 buckets and actions you intend to use; ask your AWS administrator if you do not have one.

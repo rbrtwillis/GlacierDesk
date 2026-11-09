@@ -65,7 +65,7 @@ public struct AWSService: Sendable {
     }
 
     public func upload(fileURL: URL, bucket: String, key: String,
-                       storageClass: String = "STANDARD", settings: UploadSettings = .init()) async throws {
+                       storageClass: String = "STANDARD", settings: UploadSettings = .init(), progress: (@Sendable (Double) -> Void)? = nil) async throws {
         try settings.validate()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -86,11 +86,17 @@ public struct AWSService: Sendable {
         // The CRT transfer client can ignore these settings; force the classic client.
         _ = try await run(["configure", "set", "s3.preferred_transfer_client", "classic", "--profile", profile], environmentOverrides: overrides)
         _ = try await run(["s3", "cp", fileURL.path, "s3://\(bucket)/\(key)",
-                           "--storage-class", storageClass, "--only-show-errors"], environmentOverrides: overrides)
+                           "--storage-class", storageClass, "--progress-frequency", "1"], environmentOverrides: overrides, progress: progress)
     }
 
-    public func download(bucket: String, key: String, to fileURL: URL) async throws {
-        _ = try await run(["s3", "cp", "s3://\(bucket)/\(key)", fileURL.path, "--only-show-errors"])
+    public func download(bucket: String, key: String, to fileURL: URL, progress: (@Sendable (Double) -> Void)? = nil) async throws {
+        let temporary = fileURL.deletingLastPathComponent().appendingPathComponent(".glacierdesk-\(UUID().uuidString).download")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        _ = try await run(["s3", "cp", "s3://\(bucket)/\(key)", temporary.path, "--progress-frequency", "1"], progress: progress)
+        try Task.checkCancellation()
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
+        } else { try FileManager.default.moveItem(at: temporary, to: fileURL) }
     }
 
     /// Requests a restore. `days` is bounded to S3's supported request range.
@@ -126,11 +132,14 @@ public struct AWSService: Sendable {
         return decoder
     }
 
-    private func run(_ arguments: [String], environmentOverrides: [String: String] = [:]) async throws -> CommandResult {
+    private func run(_ arguments: [String], environmentOverrides: [String: String] = [:], progress: (@Sendable (Double) -> Void)? = nil) async throws -> CommandResult {
         var command = ["--profile", profile, "--no-cli-pager", "--output", "json"] + arguments
         // `configure list-profiles` does not accept output formatting options.
         if arguments.first == "configure" { command = arguments }
-        return try await Task.detached(priority: .utility) { [executableURL, profile] in
+        let control = ProcessControl()
+        return try await withTaskCancellationHandler(operation: {
+        try Task.checkCancellation()
+        let result = try await Task.detached(priority: .utility) { [executableURL, profile] in
             let process = Process()
             process.executableURL = executableURL
             process.arguments = command
@@ -148,9 +157,24 @@ public struct AWSService: Sendable {
             process.standardError = stderr
             do { try process.run() }
             catch { throw AWSServiceError.launchFailed(error.localizedDescription) }
-            let outputTask = Task.detached { stdout.fileHandleForReading.readDataToEndOfFile() }
+            control.started(process)
+            let outputTask = Task.detached {
+                var output = Data()
+                var progressBuffer = ""
+                while true {
+                    let data = stdout.fileHandleForReading.availableData
+                    if data.isEmpty { break }
+                    if let progress {
+                        progressBuffer += String(decoding: data, as: UTF8.self)
+                        if let value = Self.progressFraction(progressBuffer) { progress(value) }
+                        if progressBuffer.count > 4096 { progressBuffer = String(progressBuffer.suffix(512)) }
+                    } else { output.append(data) }
+                }
+                return output
+            }
             let errorTask = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
             process.waitUntilExit()
+            control.finished()
             let out = await outputTask.value
             let err = await errorTask.value
             guard process.terminationStatus == 0 else {
@@ -159,6 +183,18 @@ public struct AWSService: Sendable {
             }
             return CommandResult(stdout: String(data: out, encoding: .utf8) ?? "")
         }.value
+        try Task.checkCancellation()
+        return result
+        }, onCancel: { control.cancel() })
+    }
+
+    private static func progressFraction(_ text: String) -> Double? {
+        let pattern = #"Completed\s+([0-9.]+)\s+(Bytes|KiB|MiB|GiB|TiB)/([0-9.]+)\s+(Bytes|KiB|MiB|GiB|TiB)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern), let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last else { return nil }
+        func value(_ index: Int) -> String { Range(match.range(at: index), in: text).map { String(text[$0]) } ?? "" }
+        let units: [String: Double] = ["Bytes": 1, "KiB": 1024, "MiB": 1_048_576, "GiB": 1_073_741_824, "TiB": 1_099_511_627_776]
+        guard let done = Double(value(1)), let total = Double(value(3)), total > 0, let a = units[value(2)], let b = units[value(4)] else { return nil }
+        return min(1, max(0, done * a / (total * b)))
     }
 
     private static func redact(_ message: String) -> String {
@@ -172,6 +208,15 @@ public struct AWSService: Sendable {
             value.replacingOccurrences(of: pattern, with: "[REDACTED]", options: .regularExpression)
         }
     }
+}
+
+private final class ProcessControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+    func started(_ process: Process) { lock.lock(); self.process = process; let stop = cancelled; lock.unlock(); if stop { process.interrupt() } }
+    func finished() { lock.lock(); process = nil; lock.unlock() }
+    func cancel() { lock.lock(); cancelled = true; let running = process; lock.unlock(); if let running, running.isRunning { running.interrupt() } }
 }
 
 public struct UploadSettings: Sendable {
