@@ -212,6 +212,7 @@ struct ContentView: View {
     @State private var showRestoreConfirmation = false
     @State private var selectedSection = "Browse"
     @State private var showTransferSettings = false
+    @State private var showLifecycle = false
 
     var body: some View {
         NavigationSplitView {
@@ -228,6 +229,11 @@ struct ContentView: View {
             .background(GlacierTheme.background)
         }
         .toolbar { toolbar }
+        .sheet(isPresented: $showLifecycle) {
+            if let bucket = model.selectedBucket, let account = model.identity?.account, let profile = model.connectedProfile {
+                LifecycleView(service: AWSService(profile: profile), bucket: bucket.name, account: account)
+            }
+        }
         .tint(GlacierTheme.accent)
         .task {
             model.loadRestores()
@@ -374,6 +380,8 @@ struct ContentView: View {
                     }.padding(18).frame(width: 340)
                 }
             if model.selectedBucket != nil {
+                Button { showLifecycle = true } label: { Image(systemName: "clock.badge.checkmark") }
+                    .help("Configure incomplete upload cleanup").disabled(model.isBusy || model.identity == nil)
                 Picker("Storage class", selection: $model.storageClass) {
                     Text("Standard").tag("STANDARD")
                     Text("Intelligent Tiering").tag("INTELLIGENT_TIERING")

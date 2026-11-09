@@ -64,6 +64,32 @@ public struct AWSService: Sendable {
         return try Self.decoder().decode(AWSObjectMetadata.self, from: data)
     }
 
+    /// Read the entire configuration before proposing a change. S3 PUT replaces all rules.
+    public func lifecycleSnapshot(bucket: String, account: String) async throws -> LifecycleSnapshot {
+        do {
+            let data = try await json(["s3api", "get-bucket-lifecycle-configuration", "--bucket", bucket, "--expected-bucket-owner", account])
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any], let rules = root["Rules"] as? [[String: Any]] else { throw AWSServiceError.invalidResponse }
+            let canonical = try JSONSerialization.data(withJSONObject: ["Rules": rules], options: [.sortedKeys])
+            return LifecycleSnapshot(rules: canonical, transitionMinimum: root["TransitionDefaultMinimumObjectSize"] as? String)
+        } catch AWSServiceError.commandFailed(let message) where message.contains("NoSuchLifecycleConfiguration") {
+            return LifecycleSnapshot(rules: Data("{\"Rules\":[]}".utf8), transitionMinimum: nil)
+        }
+    }
+
+    public func addCleanupRule(bucket: String, account: String, original: LifecycleSnapshot, proposed: Data) async throws {
+        let current = try await lifecycleSnapshot(bucket: bucket, account: account)
+        guard current == original else { throw AWSServiceError.commandFailed("Lifecycle configuration changed since preview. Review it again before applying.") }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("lifecycle.json")
+        try proposed.write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        var args = ["s3api", "put-bucket-lifecycle-configuration", "--bucket", bucket, "--expected-bucket-owner", account, "--lifecycle-configuration", "file://\(file.path)"]
+        if let minimum = original.transitionMinimum { args += ["--transition-default-minimum-object-size", minimum] }
+        _ = try await run(args)
+    }
+
     public func upload(fileURL: URL, bucket: String, key: String,
                        storageClass: String = "STANDARD", settings: UploadSettings = .init(), progress: (@Sendable (Double) -> Void)? = nil) async throws {
         try settings.validate()
@@ -229,6 +255,20 @@ public struct UploadSettings: Sendable {
         guard (1...5120).contains(thresholdMiB), (5...5120).contains(partSizeMiB), (1...32).contains(connections) else {
             throw AWSServiceError.commandFailed("Upload settings are outside their allowed range.")
         }
+    }
+}
+
+public struct LifecycleSnapshot: Equatable, Sendable {
+    public let rules: Data
+    public let transitionMinimum: String?
+
+    public func addingCleanup(prefix: String, days: Int) throws -> Data {
+        guard (1...3650).contains(days), var root = try JSONSerialization.jsonObject(with: rules) as? [String: Any], var list = root["Rules"] as? [[String: Any]] else { throw AWSServiceError.invalidResponse }
+        guard list.count < 1000 else { throw AWSServiceError.commandFailed("The bucket already has the maximum number of lifecycle rules.") }
+        let id = "GlacierDesk-Abort-Incomplete-" + UUID().uuidString
+        list.append(["ID": id, "Status": "Enabled", "Filter": ["Prefix": prefix], "AbortIncompleteMultipartUpload": ["DaysAfterInitiation": days]])
+        root["Rules"] = list
+        return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 }
 
