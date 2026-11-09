@@ -1,0 +1,493 @@
+import AppKit
+import SwiftUI
+
+@MainActor
+final class GlacierDeskModel: ObservableObject {
+    @Published var profiles: [String] = []
+    @Published var selectedProfile = ""
+    @Published var identity: AWSIdentity?
+    @Published var buckets: [AWSBucket] = []
+    @Published var selectedBucket: AWSBucket?
+    @Published var objects: [AWSObject] = []
+    @Published var prefixes: [AWSCommonPrefix] = []
+    @Published var prefix = ""
+    @Published var continuationToken: String?
+    @Published var canLoadMore = false
+    @Published var selectedObject: AWSObject?
+    @Published var metadata: AWSObjectMetadata?
+    @Published var isBusy = false
+    @Published var errorMessage: String?
+    @Published var notice: String?
+    @Published var activity: [String] = []
+    @Published var storageClass = "STANDARD"
+    @Published var restoreTier: RestoreTier = .standard
+    @Published var connectedProfile: String?
+
+    private var service: AWSService? {
+        let profile = connectedProfile ?? selectedProfile
+        return profile.isEmpty ? nil : AWSService(profile: profile)
+    }
+
+    func disconnect() {
+        identity = nil; connectedProfile = nil; buckets = []; selectedBucket = nil
+        objects = []; prefixes = []; selectedObject = nil; metadata = nil; prefix = ""
+    }
+
+    func loadProfiles() async {
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            let found = try await AWSService(profile: "default").listProfiles()
+            profiles = found
+            if selectedProfile.isEmpty { selectedProfile = found.first ?? "" }
+            if found.isEmpty { notice = "No shared AWS profiles were found. Configure one with `aws configure` or `aws configure sso`." }
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func connect() async {
+        guard let service else { return }
+        isBusy = true; errorMessage = nil; identity = nil; connectedProfile = nil; buckets = []; selectedBucket = nil
+        defer { isBusy = false }
+        do {
+            let who = try await service.identity()
+            identity = who
+            connectedProfile = selectedProfile
+            buckets = try await service.listBuckets()
+            activity.insert("Connected as \(who.arn)", at: 0)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func openBucket(_ bucket: AWSBucket) async {
+        selectedBucket = bucket; prefix = ""; continuationToken = nil; objects = []; prefixes = []; selectedObject = nil
+        await loadPage(reset: true)
+    }
+
+    func openPrefix(_ value: String) async {
+        prefix = value; continuationToken = nil; objects = []; prefixes = []; selectedObject = nil
+        await loadPage(reset: true)
+    }
+
+    func loadPage(reset: Bool = false) async {
+        guard let service, let selectedBucket else { return }
+        isBusy = true; errorMessage = nil
+        defer { isBusy = false }
+        do {
+            let page = try await service.listObjects(bucket: selectedBucket.name,
+                                                     prefix: prefix.isEmpty ? nil : prefix,
+                                                     continuationToken: reset ? nil : continuationToken,
+                                                     maxKeys: 500)
+            if reset { objects = []; prefixes = [] }
+            objects += page.contents ?? []
+            prefixes += page.commonPrefixes ?? []
+            continuationToken = page.nextContinuationToken
+            canLoadMore = page.isTruncated == true && continuationToken != nil
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func inspect(_ object: AWSObject) async {
+        selectedObject = object; metadata = nil
+        guard let service, let bucket = selectedBucket else { return }
+        do { metadata = try await service.headObject(bucket: bucket.name, key: object.key) }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    func upload(_ url: URL) async {
+        guard let service, let bucket = selectedBucket else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await service.upload(fileURL: url, bucket: bucket.name,
+                                     key: prefix + url.lastPathComponent, storageClass: storageClass)
+            activity.insert("Uploaded \(url.lastPathComponent) to \(bucket.name)", at: 0)
+            notice = "Upload complete."
+            await loadPage(reset: true)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func download(_ object: AWSObject, to destination: URL) async {
+        guard let service, let bucket = selectedBucket else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await service.download(bucket: bucket.name, key: object.key, to: destination)
+            activity.insert("Downloaded \(object.key)", at: 0); notice = "Download complete."
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func restore(_ object: AWSObject) async {
+        guard let service, let bucket = selectedBucket else { return }
+        isBusy = true; errorMessage = nil
+        defer { isBusy = false }
+        do {
+            try await service.restore(bucket: bucket.name, key: object.key, days: 3, tier: restoreTier)
+            activity.insert("Restore requested for \(object.key) (\(restoreTier.rawValue))", at: 0)
+            notice = "Restore request submitted. Refresh object details to check its status. AWS retrieval and temporary-copy charges may apply."
+            await inspect(object)
+        } catch { errorMessage = error.localizedDescription }
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var model = GlacierDeskModel()
+    @State private var showUpload = false
+    @State private var pendingUploadURL: URL?
+    @State private var uploadURLAccess = false
+    @State private var pendingRestore: AWSObject?
+    @State private var showUploadConfirmation = false
+    @State private var showRestoreConfirmation = false
+    @State private var selectedSection = "Browse"
+
+    var body: some View {
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            Group {
+                switch selectedSection {
+                case "Activity": activityView
+                default: browser
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .toolbar { toolbar }
+        .task { await model.loadProfiles() }
+        .fileImporter(isPresented: $showUpload, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                uploadURLAccess = url.startAccessingSecurityScopedResource()
+                pendingUploadURL = url
+                showUploadConfirmation = true
+            } else if case .failure(let error) = result { model.errorMessage = error.localizedDescription }
+        }
+        .alert("GlacierDesk", isPresented: alertShown) {
+            Button("OK", role: .cancel) { model.errorMessage = nil; model.notice = nil }
+        } message: { Text(model.errorMessage ?? model.notice ?? "") }
+        .confirmationDialog("Upload to S3?", isPresented: $showUploadConfirmation, titleVisibility: .visible) {
+            Button("Upload \(pendingUploadURL?.lastPathComponent ?? "file")") {
+                guard let url = pendingUploadURL else { return }
+                Task {
+                    await model.upload(url)
+                    if uploadURLAccess { url.stopAccessingSecurityScopedResource() }
+                    uploadURLAccess = false
+                    pendingUploadURL = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                if let url = pendingUploadURL, uploadURLAccess { url.stopAccessingSecurityScopedResource() }
+                uploadURLAccess = false
+                pendingUploadURL = nil
+            }
+        } message: {
+            Text("If this key already exists, S3 will replace it. Storage and request charges may apply. Review the selected storage class before continuing.")
+        }
+        .confirmationDialog("Request archive restore?", isPresented: $showRestoreConfirmation, titleVisibility: .visible) {
+            Button("Request \(model.restoreTier.rawValue) restore") {
+                if let object = pendingRestore { Task { await model.restore(object) } }
+            }
+            Button("Cancel", role: .cancel) { pendingRestore = nil }
+        } message: {
+            Text("AWS may charge for retrieval and for the temporary restored copy. The request lasts 3 days. Check current S3 pricing before proceeding.")
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 10) {
+                Image(systemName: "snowflake").font(.title2).foregroundStyle(.cyan)
+                    .frame(width: 38, height: 38).background(.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("GlacierDesk").font(.headline)
+                    Text("S3 archive browser").font(.caption).foregroundStyle(.secondary)
+                }
+            }.padding(.horizontal, 14).padding(.top, 12)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("AWS PROFILE").font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 14)
+                HStack(spacing: 8) {
+                    Picker("Profile", selection: $model.selectedProfile) {
+                        if model.profiles.isEmpty { Text("No profiles found").tag("") }
+                        ForEach(model.profiles, id: \.self) { Text($0).tag($0) }
+                    }.labelsHidden().disabled(model.isBusy || model.identity != nil).frame(maxWidth: .infinity)
+                    Button { Task { await model.loadProfiles() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }.help("Reload AWS profiles")
+                }.padding(.horizontal, 12)
+                Button { Task { await model.connect() } } label: {
+                    HStack { Image(systemName: model.identity == nil ? "link" : "checkmark.circle.fill"); Text(model.identity == nil ? "Connect" : "Reconnect") }
+                        .frame(maxWidth: .infinity)
+                }.buttonStyle(.borderedProminent).disabled(model.selectedProfile.isEmpty || model.isBusy).padding(.horizontal, 12)
+                if let identity = model.identity {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Account  \(identity.account)").font(.caption.monospaced())
+                        Text(identity.arn).font(.caption2).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+                    }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal, 12)
+                    Button("Disconnect") { model.disconnect() }
+                        .disabled(model.isBusy).padding(.horizontal, 12)
+                } else {
+                    Text("Confirm the account and principal before browsing or transferring objects.")
+                        .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14)
+                }
+            }
+
+            Divider().padding(.horizontal, 12)
+            List(selection: $selectedSection) {
+                Label("Browse", systemImage: "externaldrive").tag("Browse")
+                Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
+            }.listStyle(.sidebar).frame(minHeight: 90, maxHeight: 130)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack { Text("BUCKETS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer(); if model.isBusy { ProgressView().controlSize(.small) } }
+                if model.identity == nil {
+                    Text("Connect to load buckets.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
+                } else if model.buckets.isEmpty {
+                    Text("No buckets available.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(model.buckets) { bucket in
+                                Button { selectedSection = "Browse"; Task { await model.openBucket(bucket) } } label: {
+                                    HStack(spacing: 9) {
+                                        Image(systemName: "bucket").foregroundStyle(.cyan)
+                                        Text(bucket.name).lineLimit(1)
+                                        Spacer()
+                                        if model.selectedBucket?.id == bucket.id { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary) }
+                                    }.font(.callout).padding(.vertical, 7).padding(.horizontal, 8)
+                                        .background(model.selectedBucket?.id == bucket.id ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                                }.buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }.padding(.horizontal, 14)
+            Spacer(minLength: 4)
+            Text("AWS CLI profile selection is explicit. Glacier vaults and delete operations are not supported.")
+                .font(.caption2).foregroundStyle(.tertiary).padding(14)
+        }
+        .frame(minWidth: 225, idealWidth: 250)
+    }
+
+    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            if model.selectedBucket != nil {
+                Picker("Storage class", selection: $model.storageClass) {
+                    Text("Standard").tag("STANDARD")
+                    Text("Intelligent Tiering").tag("INTELLIGENT_TIERING")
+                    Text("Glacier Instant").tag("GLACIER_IR")
+                    Text("Glacier Flexible").tag("GLACIER")
+                    Text("Deep Archive").tag("DEEP_ARCHIVE")
+                }.frame(width: 175).help("Storage class for the next upload")
+                Button { showUpload = true } label: { Label("Upload", systemImage: "arrow.up.doc") }
+                    .disabled(model.identity == nil || model.selectedBucket == nil || model.isBusy)
+            }
+            Button { Task { await model.loadPage(reset: true) } } label: { Image(systemName: "arrow.clockwise") }
+                .help("Refresh current location").disabled(model.selectedBucket == nil || model.isBusy)
+        }
+    }
+
+    private var browser: some View {
+        VStack(spacing: 0) {
+            if model.identity == nil {
+                welcome
+            } else if model.selectedBucket == nil {
+                EmptyState(title: "Choose a bucket", icon: "externaldrive", detail: "Select a bucket from the sidebar to browse its objects.")
+            } else {
+                locationHeader
+                Divider()
+                HStack(spacing: 0) {
+                    objectBrowser
+                    Divider()
+                    inspector.frame(width: 290)
+                }
+            }
+        }
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "snowflake").font(.system(size: 42, weight: .light)).foregroundStyle(.cyan)
+            VStack(spacing: 6) {
+                Text("Explore your S3 archives").font(.title2.weight(.semibold))
+                Text("Choose a shared AWS profile, connect, and browse buckets and prefixes.")
+                    .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+            }
+            Button { Task { await model.connect() } } label: { Label("Connect to AWS", systemImage: "link") }
+                .buttonStyle(.borderedProminent).disabled(model.selectedProfile.isEmpty || model.isBusy)
+            if model.profiles.isEmpty {
+                Text("No profiles detected yet. Set up an AWS profile with the AWS CLI, then reload.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var locationHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "bucket.fill").foregroundStyle(.cyan)
+            Text(model.selectedBucket?.name ?? "").font(.headline)
+            if !model.prefix.isEmpty {
+                Text("/").foregroundStyle(.tertiary)
+                Text(model.prefix).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Text("\(model.objects.count) objects").font(.caption).foregroundStyle(.secondary)
+        }.padding(.horizontal, 20).padding(.vertical, 14)
+    }
+
+    private var objectBrowser: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("NAME").frame(maxWidth: .infinity, alignment: .leading)
+                Text("SIZE").frame(width: 90, alignment: .trailing)
+                Text("STORAGE CLASS").frame(width: 150, alignment: .trailing)
+            }.font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 9)
+            Divider()
+            if model.objects.isEmpty && model.prefixes.isEmpty && !model.isBusy {
+                EmptyState(title: "This prefix is empty", icon: "folder", detail: "Upload an object or open another prefix.")
+            } else {
+                List(selection: Binding(get: { model.selectedObject?.key }, set: { key in
+                    if let object = model.objects.first(where: { $0.key == key }) { Task { await model.inspect(object) } }
+                })) {
+                    if !model.prefix.isEmpty {
+                        Button { Task { await model.openPrefix(parentPrefix(model.prefix)) } } label: {
+                            Label("..", systemImage: "arrow.up.folder").foregroundStyle(.secondary)
+                        }.buttonStyle(.plain)
+                    }
+                    ForEach(model.prefixes) { folder in
+                        Button { Task { await model.openPrefix(folder.prefix) } } label: {
+                            HStack { Label(folderName(folder.prefix), systemImage: "folder.fill").foregroundStyle(.cyan); Spacer(); Text("Folder").font(.caption).foregroundStyle(.secondary) }
+                        }.buttonStyle(.plain)
+                    }
+                    ForEach(model.objects.filter { $0.key != model.prefix }) { object in
+                        HStack {
+                            Label(objectName(object.key), systemImage: archiveIcon(object.storageClass))
+                                .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                            Text(formatSize(object.size)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 90, alignment: .trailing)
+                            Text(object.storageClass ?? "STANDARD").font(.caption).foregroundStyle(.secondary).frame(width: 150, alignment: .trailing).lineLimit(1)
+                        }.tag(object.key).contentShape(Rectangle())
+                    }
+                }.listStyle(.plain)
+                if model.canLoadMore {
+                    Button { Task { await model.loadPage() } } label: {
+                        HStack { Spacer(); Text("Load next page"); Image(systemName: "chevron.down"); Spacer() }.padding(9)
+                    }.buttonStyle(.plain).background(Color(nsColor: .controlBackgroundColor))
+                }
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var inspector: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let object = model.selectedObject {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("OBJECT DETAILS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(objectName(object.key)).font(.headline).lineLimit(3).textSelection(.enabled)
+                }
+                Divider()
+                detailRow("Key", object.key)
+                detailRow("Size", formatSize(model.metadata?.contentLength ?? object.size))
+                detailRow("Storage class", model.metadata?.storageClass ?? object.storageClass ?? "STANDARD")
+                detailRow("Modified", dateString(model.metadata?.lastModified ?? object.lastModified))
+                if let restore = model.metadata?.restore { restoreStatus(restore) }
+                else if isArchive(object.storageClass) {
+                    Text("Archived object").font(.caption.weight(.medium)).padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                    Text("Restore it before downloading. Retrieval charges may apply.").font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                if isArchive(object.storageClass) {
+                    Picker("Retrieval tier", selection: $model.restoreTier) {
+                        ForEach(availableRestoreTiers(for: model.selectedObject), id: \.self) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.menu)
+                    Button { pendingRestore = object; showRestoreConfirmation = true } label: { Label("Request restore", systemImage: "shippingbox") }
+                        .buttonStyle(.borderedProminent).frame(maxWidth: .infinity).disabled(model.isBusy || isRestorePending(model.metadata?.restore))
+                    Button { Task { await model.inspect(object) } } label: { Label("Refresh restore status", systemImage: "arrow.clockwise") }
+                        .buttonStyle(.bordered).frame(maxWidth: .infinity).disabled(model.isBusy)
+                }
+                Button { chooseDownloadDestination(for: object) } label: { Label("Download…", systemImage: "arrow.down.doc") }
+                    .buttonStyle(.bordered).frame(maxWidth: .infinity)
+                    .disabled(model.isBusy || (isArchive(object.storageClass) && !isRestored(model.metadata?.restore)))
+                Link("S3 Glacier pricing", destination: URL(string: "https://aws.amazon.com/s3/pricing/")!)
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                EmptyState(title: "Select an object", icon: "doc.text.magnifyingglass", detail: "Details and archive actions will appear here.")
+            }
+            Spacer(minLength: 0)
+        }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var activityView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Activity").font(.title2.weight(.semibold)).padding(20)
+            Divider()
+            if model.activity.isEmpty {
+                EmptyState(title: "No activity yet", icon: "clock.arrow.circlepath", detail: "Uploads, downloads, and restore requests will appear here.")
+            } else {
+                List(model.activity, id: \.self) { item in Label(item, systemImage: "checkmark.circle").padding(.vertical, 5) }.listStyle(.plain)
+            }
+        }
+    }
+
+    private var alertShown: Binding<Bool> {
+        Binding(get: { model.errorMessage != nil || model.notice != nil }, set: { if !$0 { model.errorMessage = nil; model.notice = nil } })
+    }
+
+    private func detailRow(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            Text(value).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+    private func restoreStatus(_ value: String) -> some View {
+        let restored = value.contains("ongoing-request=\"false\"")
+        return VStack(alignment: .leading, spacing: 5) {
+            Label(restored ? "Restore available" : "Restore in progress", systemImage: restored ? "checkmark.circle.fill" : "clock")
+                .font(.caption.weight(.semibold)).foregroundColor(restored ? .green : .orange)
+            Text(value.replacingOccurrences(of: "\"", with: "")).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+        }.padding(9).frame(maxWidth: .infinity, alignment: .leading).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    }
+    private func chooseDownloadDestination(for object: AWSObject) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = URL(fileURLWithPath: object.key).lastPathComponent
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await model.download(object, to: url) }
+    }
+    private func availableRestoreTiers(for object: AWSObject?) -> [RestoreTier] {
+        object?.storageClass?.uppercased() == "DEEP_ARCHIVE" ? [.standard, .bulk] : RestoreTier.allCases
+    }
+    private func folderName(_ value: String) -> String { String(value.dropLast().split(separator: "/").last ?? "") }
+    private func objectName(_ value: String) -> String { URL(fileURLWithPath: value).lastPathComponent }
+    private func parentPrefix(_ value: String) -> String {
+        let trimmed = String(value.dropLast())
+        guard let slash = trimmed.lastIndex(of: "/") else { return "" }
+        return String(trimmed[...slash])
+    }
+    private func formatSize(_ bytes: Int64?) -> String {
+        guard let bytes else { return "—" }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+    private func dateString(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        return date.formatted(date: .abbreviated, time: .shortened)
+    }
+    private func isArchive(_ storageClass: String?) -> Bool { ["GLACIER", "DEEP_ARCHIVE"].contains(storageClass?.uppercased() ?? "") }
+    private func archiveIcon(_ storageClass: String?) -> String { isArchive(storageClass) ? "archivebox.fill" : "doc" }
+    private func isRestored(_ value: String?) -> Bool { value?.contains("ongoing-request=\"false\"") == true }
+    private func isRestorePending(_ value: String?) -> Bool { value?.contains("ongoing-request=\"true\"") == true }
+}
+
+private struct EmptyState: View {
+    let title: String
+    let icon: String
+    let detail: String
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 30, weight: .light)).foregroundStyle(.secondary)
+            Text(title).font(.headline)
+            Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 340)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
