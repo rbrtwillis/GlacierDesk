@@ -1,6 +1,6 @@
 # GlacierDesk project plan
 
-Copyright © 2026 willislabs.ai. Ownership and licensing terms are to be finalized before publication.
+Copyright © 2026 WillisLabs.ai. Licensed under the Apache License, Version 2.0.
 
 ## Product
 
@@ -36,7 +36,7 @@ GlacierDesk is a native macOS application for browsing, uploading, restoring, an
 
 ## Delivery milestones
 
-1. Foundation: confirm macOS deployment target, SDK feasibility, identity handling, license, repository ownership, and build tooling.
+1. Foundation: confirm macOS deployment target, SDK feasibility, identity handling, and build tooling.
 2. Browse: connect securely, identify the principal, and browse buckets and paginated objects.
 3. Upload: implement storage-class selection and reliable file/folder transfers.
 4. Restore and download: implement restore requests, status, expiration, and verified downloads.
@@ -50,9 +50,9 @@ GlacierDesk is a native macOS application for browsing, uploading, restoring, an
 
 ## Ownership and publication decisions
 
-- Proposed project copyright notice: `Copyright © 2026 willislabs.ai`. Confirm the legal copyright holder if it differs from the brand.
-- Choose an open-source license before publishing; Apache-2.0 is a proposed default, not yet adopted. Contributor copyright and contribution terms should be reflected accurately rather than implying automatic transfer of ownership.
-- Choose the GitHub account or organization that will own the public repository, and whether “GitHub project” also means a Projects board.
+- Project copyright notice: `Copyright © 2026 WillisLabs.ai`. Contributor copyright and contribution terms should be reflected accurately rather than implying automatic transfer of ownership.
+- The project uses the Apache License, Version 2.0 and is hosted at `rbrtwillis/GlacierDesk`.
+- Create a GitHub Projects board when project permissions are available.
 
 ## References
 
