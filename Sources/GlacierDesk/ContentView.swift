@@ -148,9 +148,10 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(GlacierTheme.background)
         }
         .toolbar { toolbar }
+        .tint(GlacierTheme.accent)
         .task { await model.loadProfiles() }
         .fileImporter(isPresented: $showUpload, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
             if case .success(let urls) = result, let url = urls.first {
@@ -193,8 +194,11 @@ struct ContentView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 10) {
-                Image(systemName: "snowflake").font(.title2).foregroundStyle(.cyan)
-                    .frame(width: 38, height: 38).background(.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
+                if let icon = NSImage(contentsOf: Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/GlacierDesk.png")) {
+                    Image(nsImage: icon).resizable().interpolation(.high).frame(width: 40, height: 40).clipShape(RoundedRectangle(cornerRadius: 9))
+                } else {
+                    Image(systemName: "snowflake").font(.title2).foregroundStyle(GlacierTheme.accent).frame(width: 40, height: 40)
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     Text("GlacierDesk").font(.headline)
                     Text("S3 archive browser").font(.caption).foregroundStyle(.secondary)
@@ -250,7 +254,7 @@ struct ContentView: View {
                             ForEach(model.buckets) { bucket in
                                 Button { selectedSection = "Browse"; Task { await model.openBucket(bucket) } } label: {
                                     HStack(spacing: 9) {
-                                        Image(systemName: "bucket").foregroundStyle(.cyan)
+                                        Image(systemName: "bucket").foregroundStyle(GlacierTheme.accent)
                                         Text(bucket.name).lineLimit(1)
                                         Spacer()
                                         if model.selectedBucket?.id == bucket.id { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary) }
@@ -267,6 +271,7 @@ struct ContentView: View {
                 .font(.caption2).foregroundStyle(.tertiary).padding(14)
         }
         .frame(minWidth: 225, idealWidth: 250)
+        .background(GlacierTheme.sidebar)
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
@@ -307,7 +312,7 @@ struct ContentView: View {
 
     private var welcome: some View {
         VStack(spacing: 18) {
-            Image(systemName: "snowflake").font(.system(size: 42, weight: .light)).foregroundStyle(.cyan)
+            Image(systemName: "snowflake").font(.system(size: 42, weight: .light)).foregroundStyle(GlacierTheme.accent)
             VStack(spacing: 6) {
                 Text("Explore your S3 archives").font(.title2.weight(.semibold))
                 Text("Choose a shared AWS profile, connect, and browse buckets and prefixes.")
@@ -324,7 +329,7 @@ struct ContentView: View {
 
     private var locationHeader: some View {
         HStack(spacing: 8) {
-            Image(systemName: "bucket.fill").foregroundStyle(.cyan)
+            Image(systemName: "bucket.fill").foregroundStyle(GlacierTheme.accent)
             Text(model.selectedBucket?.name ?? "").font(.headline)
             if !model.prefix.isEmpty {
                 Text("/").foregroundStyle(.tertiary)
@@ -356,7 +361,7 @@ struct ContentView: View {
                     }
                     ForEach(model.prefixes) { folder in
                         Button { Task { await model.openPrefix(folder.prefix) } } label: {
-                            HStack { Label(folderName(folder.prefix), systemImage: "folder.fill").foregroundStyle(.cyan); Spacer(); Text("Folder").font(.caption).foregroundStyle(.secondary) }
+                            HStack { Label(folderName(folder.prefix), systemImage: "folder.fill").foregroundStyle(GlacierTheme.accent); Spacer(); Text("Folder").font(.caption).foregroundStyle(.secondary) }
                         }.buttonStyle(.plain)
                     }
                     ForEach(model.objects.filter { $0.key != model.prefix }) { object in
