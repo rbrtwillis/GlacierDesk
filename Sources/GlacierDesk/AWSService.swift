@@ -48,6 +48,20 @@ public struct AWSService: Sendable {
         return try Self.decoder().decode(BucketResponse.self, from: data).buckets ?? []
     }
 
+    /// Glacier vaults are regional and are not S3 buckets.
+    public func listLegacyVaults(region: String) async throws -> [LegacyVault] {
+        var marker: String?
+        var vaults: [LegacyVault] = []
+        repeat {
+            var args = ["glacier", "list-vaults", "--account-id", "-", "--region", region, "--limit", "1000", "--no-paginate"]
+            if let marker { args += ["--marker", marker] }
+            let page = try Self.decoder().decode(LegacyVaultPage.self, from: await json(args))
+            vaults.append(contentsOf: page.vaults ?? [])
+            marker = page.marker?.isEmpty == false ? page.marker : nil
+        } while marker != nil
+        return vaults
+    }
+
     /// Fetches one S3 page. Pass `nextContinuationToken` from the prior result to continue.
     public func listObjects(bucket: String, prefix: String? = nil,
                             continuationToken: String? = nil, maxKeys: Int = 1000) async throws -> AWSObjectPage {
@@ -115,12 +129,12 @@ public struct AWSService: Sendable {
                            "--storage-class", storageClass, "--progress-frequency", "1"], environmentOverrides: overrides, progress: progress)
     }
 
-    public func download(bucket: String, key: String, to fileURL: URL, progress: (@Sendable (Double) -> Void)? = nil) async throws {
+    public func download(bucket: String, key: String, to fileURL: URL, overwrite: Bool = true, progress: (@Sendable (Double) -> Void)? = nil) async throws {
         let temporary = fileURL.deletingLastPathComponent().appendingPathComponent(".glacierdesk-\(UUID().uuidString).download")
         defer { try? FileManager.default.removeItem(at: temporary) }
         _ = try await run(["s3", "cp", "s3://\(bucket)/\(key)", temporary.path, "--progress-frequency", "1"], progress: progress)
         try Task.checkCancellation()
-        if FileManager.default.fileExists(atPath: fileURL.path) {
+        if overwrite && FileManager.default.fileExists(atPath: fileURL.path) {
             _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
         } else { try FileManager.default.moveItem(at: temporary, to: fileURL) }
     }
@@ -284,6 +298,24 @@ public struct AWSBucket: Decodable, Sendable, Identifiable {
     public let creationDate: Date?
     public var id: String { name }
     enum CodingKeys: String, CodingKey { case name = "Name", creationDate = "CreationDate" }
+}
+
+public struct LegacyVault: Decodable, Sendable, Identifiable {
+    public let vaultName: String
+    public let vaultARN: String?
+    public let lastInventoryDate: String?
+    public let numberOfArchives: Int64?
+    public let sizeInBytes: Int64?
+    public var id: String { vaultARN ?? vaultName }
+    enum CodingKeys: String, CodingKey {
+        case vaultName = "VaultName", vaultARN = "VaultARN", lastInventoryDate = "LastInventoryDate"
+        case numberOfArchives = "NumberOfArchives", sizeInBytes = "SizeInBytes"
+    }
+}
+private struct LegacyVaultPage: Decodable {
+    let vaults: [LegacyVault]?
+    let marker: String?
+    enum CodingKeys: String, CodingKey { case vaults = "VaultList", marker = "Marker" }
 }
 
 public struct AWSObjectPage: Decodable, Sendable {

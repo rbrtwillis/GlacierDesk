@@ -7,12 +7,17 @@ Version 0.1 is an early SwiftUI development checkpoint (the app bundle reports `
 ## What's included
 
 - Named AWS profile selection, STS account and principal display, and bucket and prefix browsing with pagination.
-- Single-file upload with storage-class selection, configurable multipart threshold, part size and parallel requests; download of available objects.
+- Single-file upload with storage-class selection, configurable multipart threshold, part size and parallel requests; individual and multi-selection download of available objects.
 - Transfer progress, cancellation and manual retry; restore requests and locally saved restore status for S3 Glacier Flexible Retrieval and Deep Archive.
 - A preview and confirmation workflow for an incomplete-multipart-upload lifecycle rule, preserving existing rules in the proposed configuration.
 - Native light and dark appearances.
+- Read-only listing of legacy Amazon Glacier vaults in a selected AWS Region.
 
-This version does not support folder uploads, deletion, legacy Glacier vaults, resumable transfers across restarts, or automatic discovery of restore requests made outside the app. Restore requests use a three-day temporary copy. Live AWS end-to-end validation and accessibility review remain outstanding.
+This version does not support folder uploads, deletion, legacy vault archive browsing or transfers, resumable transfers across restarts, or automatic discovery of restore requests made outside the app. Restore requests use a three-day temporary copy. Live AWS end-to-end validation and accessibility review remain outstanding.
+
+In the object list, use Command-click or Shift-click to select multiple objects, then choose **Download selected** and a destination folder. Existing local files are skipped; archived objects without a completed restore and failed downloads are reported in Activity. Batch downloads run sequentially.
+
+To find older Glacier vaults, connect a profile, select **Legacy vaults**, enter the Region where the vaults were created, and choose **Find vaults**. Vault metadata is based on the last inventory and the identity needs `glacier:ListVaults` permission. Vaults are a separate AWS service, so they do not appear in the S3 bucket list. Listing vaults does not start an inventory retrieval job.
 
 ## Build locally
 

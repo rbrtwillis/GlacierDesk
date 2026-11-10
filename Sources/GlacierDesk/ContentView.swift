@@ -82,6 +82,44 @@ final class GlacierDeskModel: ObservableObject {
         retryTransfer = { [weak self] in self?.startDownload(object, to: destination) }
         transferTask = Task { defer { transferTask = nil }; await download(object, to: destination) }
     }
+    func startBatchDownload(_ objects: [AWSObject], to directory: URL) {
+        guard transferTask == nil, let service, let bucket = selectedBucket else { return }
+        retryTransfer = nil
+        transferTask = Task {
+            isBusy = true
+            defer { isBusy = false; transferTask = nil }
+            var completed = 0
+            var skipped: [String] = []
+            for (index, object) in objects.enumerated() {
+                if Task.isCancelled { break }
+                let filename = URL(fileURLWithPath: object.key).lastPathComponent
+                let destination = directory.appendingPathComponent(filename)
+                transferProgress = Double(index) / Double(objects.count)
+                transferStatus = "Downloading \(index + 1) of \(objects.count): \(filename)"
+                if filename.isEmpty || FileManager.default.fileExists(atPath: destination.path) {
+                    skipped.append("\(object.key): destination already exists or name is invalid")
+                    continue
+                }
+                do {
+                    if ["GLACIER", "DEEP_ARCHIVE"].contains(object.storageClass?.uppercased() ?? "") {
+                        let metadata = try await service.headObject(bucket: bucket.name, key: object.key)
+                        guard metadata.restore?.contains("ongoing-request=\"false\"") == true else {
+                            skipped.append("\(object.key): restore required or pending")
+                            continue
+                        }
+                    }
+                    try await service.download(bucket: bucket.name, key: object.key, to: destination, overwrite: false)
+                    completed += 1
+                } catch {
+                    if Task.isCancelled { break }
+                    skipped.append("\(object.key): \(error.localizedDescription)")
+                }
+            }
+            transferProgress = Task.isCancelled ? nil : 1
+            transferStatus = "\(Task.isCancelled ? "Cancelled. " : "")Downloaded \(completed) of \(objects.count)." + (skipped.isEmpty ? "" : " Skipped or failed:\n" + skipped.joined(separator: "\n"))
+            activity.insert("Downloaded \(completed) of \(objects.count) selected objects", at: 0)
+        }
+    }
 
     func disconnect() {
         retryTransfer = nil
@@ -213,6 +251,7 @@ struct ContentView: View {
     @State private var selectedSection = "Browse"
     @State private var showTransferSettings = false
     @State private var showLifecycle = false
+    @State private var selectedKeys: Set<String> = []
 
     var body: some View {
         NavigationSplitView {
@@ -222,6 +261,9 @@ struct ContentView: View {
                 switch selectedSection {
                 case "Activity": activityView
                 case "Restores": restoresView
+                case "Vaults":
+                    if let profile = model.connectedProfile { LegacyVaultView(profile: profile) }
+                    else { EmptyState(title: "Connect to AWS", icon: "link", detail: "Connect a profile to find legacy Glacier vaults.") }
                 default: browser
                 }
             }
@@ -229,6 +271,12 @@ struct ContentView: View {
             .background(GlacierTheme.background)
         }
         .toolbar { toolbar }
+        .onChange(of: model.selectedBucket?.name) { _ in selectedKeys = [] }
+        .onChange(of: model.prefix) { _ in selectedKeys = [] }
+        .onChange(of: selectedKeys) { keys in
+            if keys.count == 1, let key = keys.first, let object = model.objects.first(where: { $0.key == key }) { Task { await model.inspect(object) } }
+            else { model.selectedObject = nil; model.metadata = nil }
+        }
         .sheet(isPresented: $showLifecycle) {
             if let bucket = model.selectedBucket, let account = model.identity?.account, let profile = model.connectedProfile {
                 LifecycleView(service: AWSService(profile: profile), bucket: bucket.name, account: account)
@@ -329,7 +377,8 @@ struct ContentView: View {
                 Label("Browse", systemImage: "externaldrive").tag("Browse")
                 Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
                 Label("Restores", systemImage: "archivebox").tag("Restores")
-            }.listStyle(.sidebar).frame(minHeight: 120, maxHeight: 160)
+                Label("Legacy vaults", systemImage: "externaldrive.badge.clock").tag("Vaults")
+            }.listStyle(.sidebar).frame(minHeight: 150, maxHeight: 190)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack { Text("BUCKETS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
@@ -345,7 +394,7 @@ struct ContentView: View {
                                 Button { selectedSection = "Browse"; Task { await model.openBucket(bucket) } } label: {
                                     HStack(spacing: 9) {
                                         Image(systemName: "bucket").foregroundStyle(GlacierTheme.accent)
-                                        Text(bucket.name).lineLimit(1)
+                                        Text(bucket.name).lineLimit(nil).fixedSize(horizontal: false, vertical: true).help(bucket.name)
                                         Spacer()
                                         if model.selectedBucket?.id == bucket.id { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary) }
                                     }.font(.callout).padding(.vertical, 7).padding(.horizontal, 8)
@@ -357,10 +406,11 @@ struct ContentView: View {
                 }
             }.padding(.horizontal, 14)
             Spacer(minLength: 4)
-            Text("AWS CLI profile selection is explicit. Glacier vaults and delete operations are not supported.")
+            Text("AWS CLI profile selection is explicit. Legacy vault listing is read-only.")
                 .font(.caption2).foregroundStyle(.tertiary).padding(14)
         }
-        .frame(minWidth: 225, idealWidth: 250)
+        .frame(minWidth: 250, idealWidth: 320)
+        .navigationSplitViewColumnWidth(min: 250, ideal: 320, max: 600)
         .background(GlacierTheme.sidebar)
     }
 
@@ -379,7 +429,9 @@ struct ContentView: View {
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }.padding(18).frame(width: 340)
                 }
-            if model.selectedBucket != nil {
+            if model.selectedBucket != nil && selectedSection == "Browse" {
+                Button { chooseBatchDirectory() } label: { Label("Download selected (\(selectedKeys.count))", systemImage: "arrow.down.doc") }
+                    .disabled(selectedKeys.isEmpty || model.isBusy)
                 Button { showLifecycle = true } label: { Image(systemName: "clock.badge.checkmark") }
                     .help("Configure incomplete upload cleanup").disabled(model.isBusy || model.identity == nil)
                 Picker("Storage class", selection: $model.storageClass) {
@@ -393,7 +445,7 @@ struct ContentView: View {
                     .disabled(model.identity == nil || model.selectedBucket == nil || model.isBusy)
             }
             Button { Task { await model.loadPage(reset: true) } } label: { Image(systemName: "arrow.clockwise") }
-                .help("Refresh current location").disabled(model.selectedBucket == nil || model.isBusy)
+                .help("Refresh current location").disabled(selectedSection != "Browse" || model.selectedBucket == nil || model.isBusy)
         }
     }
 
@@ -435,7 +487,7 @@ struct ContentView: View {
     private var locationHeader: some View {
         HStack(spacing: 8) {
             Image(systemName: "bucket.fill").foregroundStyle(GlacierTheme.accent)
-            Text(model.selectedBucket?.name ?? "").font(.headline)
+            Text(model.selectedBucket?.name ?? "").font(.headline).lineLimit(2).textSelection(.enabled).help(model.selectedBucket?.name ?? "")
             if !model.prefix.isEmpty {
                 Text("/").foregroundStyle(.tertiary)
                 Text(model.prefix).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
@@ -456,9 +508,7 @@ struct ContentView: View {
             if model.objects.isEmpty && model.prefixes.isEmpty && !model.isBusy {
                 EmptyState(title: "This prefix is empty", icon: "folder", detail: "Upload an object or open another prefix.")
             } else {
-                List(selection: Binding(get: { model.selectedObject?.key }, set: { key in
-                    if let object = model.objects.first(where: { $0.key == key }) { Task { await model.inspect(object) } }
-                })) {
+                List(selection: $selectedKeys) {
                     if !model.prefix.isEmpty {
                         Button { Task { await model.openPrefix(parentPrefix(model.prefix)) } } label: {
                             Label("..", systemImage: "arrow.up.folder").foregroundStyle(.secondary)
@@ -472,7 +522,7 @@ struct ContentView: View {
                     ForEach(model.objects.filter { $0.key != model.prefix }) { object in
                         HStack {
                             Label(objectName(object.key), systemImage: archiveIcon(object.storageClass))
-                                .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                                .lineLimit(2).help(object.key).frame(maxWidth: .infinity, alignment: .leading)
                             Text(formatSize(object.size)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 90, alignment: .trailing)
                             Text(object.storageClass ?? "STANDARD").font(.caption).foregroundStyle(.secondary).frame(width: 150, alignment: .trailing).lineLimit(1)
                         }.tag(object.key).contentShape(Rectangle())
@@ -596,6 +646,16 @@ struct ContentView: View {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.startDownload(object, to: url)
+    }
+    private func chooseBatchDirectory() {
+        let objects = model.objects.filter { selectedKeys.contains($0.key) }
+        guard !objects.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
+        panel.prompt = "Download here"
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        model.startBatchDownload(objects, to: folder)
+        selectedSection = "Activity"
     }
     private func availableRestoreTiers(for object: AWSObject?) -> [RestoreTier] {
         object?.storageClass?.uppercased() == "DEEP_ARCHIVE" ? [.standard, .bulk] : RestoreTier.allCases
