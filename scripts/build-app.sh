@@ -44,4 +44,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>NSHumanReadableCopyright</key><string>Copyright © 2026 WillisLabs.ai</string>
 </dict></plist>
 PLIST
+# Finder displays the bundle directory's modification time, which does not
+# automatically change when only files inside an existing bundle are replaced.
+touch "$app"
 echo "Built $app"
