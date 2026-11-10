@@ -9,6 +9,7 @@ struct LegacyVaultView: View {
     @State private var busy = false
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 14) {
             Text("Legacy Glacier vaults").font(.title2.weight(.semibold))
             Text("Vaults belong to the older Amazon Glacier service and are listed one AWS Region at a time. They are separate from S3 buckets.")
@@ -24,7 +25,8 @@ struct LegacyVaultView: View {
             if let loadedRegion {
                 Text("\(vaults.count) vaults in \(loadedRegion)").font(.caption).foregroundStyle(.secondary)
                 if vaults.isEmpty && !busy { Text("No vaults found in this Region for the connected account.").foregroundStyle(.secondary) }
-                List(vaults) { vault in
+                LazyVStack(alignment: .leading, spacing: 10) {
+                ForEach(vaults) { vault in
                     VStack(alignment: .leading, spacing: 5) {
                         Text(vault.vaultName).font(.headline).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                         if let arn = vault.vaultARN { Text(arn).font(.caption.monospaced()).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
@@ -33,14 +35,14 @@ struct LegacyVaultView: View {
                         Text("Last inventory: \(vault.lastInventoryDate ?? "Not available")").font(.caption).foregroundStyle(.secondary)
                     }.padding(.vertical, 6)
                 }
+                }
             } else {
-                Spacer()
-                Text("Enter the Region where your vaults were created and select Find vaults.").foregroundStyle(.secondary)
-                Spacer()
+                Text("Enter the Region where your vaults were created and select Find vaults.").foregroundStyle(.secondary).padding(.vertical, 20)
             }
             Text("Vault counts reflect the last inventory. Archive browsing, retrieval, and uploads for legacy vaults are not yet supported.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }.padding(20).frame(maxWidth: .infinity, alignment: .topLeading)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func load() async {

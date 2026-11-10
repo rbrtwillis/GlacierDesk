@@ -255,7 +255,9 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            sidebar
+            ScrollView { sidebar }
+                .frame(maxHeight: .infinity, alignment: .top)
+                .background(GlacierTheme.sidebar)
         } detail: {
             Group {
                 switch selectedSection {
@@ -402,7 +404,7 @@ struct ContentView: View {
                                 }.buttonStyle(.plain).disabled(model.isBusy)
                             }
                         }
-                    }
+                    }.frame(minHeight: 80, maxHeight: 300)
                 }
             }.padding(.horizontal, 14)
             Spacer(minLength: 4)
