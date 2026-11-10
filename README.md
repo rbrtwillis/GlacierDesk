@@ -1,8 +1,18 @@
-# GlacierDesk
+# GlacierDesk 0.1
 
-A planned native macOS app for browsing, uploading, restoring, and downloading Amazon S3 objects, with a focus on S3 Glacier storage classes.
+A native macOS app for browsing, uploading, restoring, and downloading Amazon S3 objects, with a focus on S3 Glacier storage classes.
 
-GlacierDesk is an early native SwiftUI application. See [PLAN.md](PLAN.md) for the planned features, credential-security design, architecture, and milestones.
+Version 0.1 is an early SwiftUI development checkpoint (the app bundle reports `0.1.0`). It uses the AWS CLI and existing AWS profiles. See [PLAN.md](PLAN.md) for current limitations and next milestones, and [DESIGN.md](DESIGN.md) for the visual identity.
+
+## What's included
+
+- Named AWS profile selection, STS account and principal display, and bucket and prefix browsing with pagination.
+- Single-file upload with storage-class selection, configurable multipart threshold, part size and parallel requests; download of available objects.
+- Transfer progress, cancellation and manual retry; restore requests and locally saved restore status for S3 Glacier Flexible Retrieval and Deep Archive.
+- A preview and confirmation workflow for an incomplete-multipart-upload lifecycle rule, preserving existing rules in the proposed configuration.
+- Native light and dark appearances.
+
+This version does not support folder uploads, deletion, legacy Glacier vaults, resumable transfers across restarts, or automatic discovery of restore requests made outside the app. Restore requests use a three-day temporary copy. Live AWS end-to-end validation and accessibility review remain outstanding.
 
 ## Build locally
 
