@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Small AWS CLI adapter for the first GlacierDesk browsing and transfer flows.
 /// Every AWS command is pinned to an explicitly selected shared AWS profile.
@@ -60,6 +61,50 @@ public struct AWSService: Sendable {
             marker = page.marker?.isEmpty == false ? page.marker : nil
         } while marker != nil
         return vaults
+    }
+
+    public func listLegacyJobs(vault: String, region: String) async throws -> [LegacyJob] {
+        let data = try await json(["glacier", "list-jobs", "--account-id", "-", "--vault-name", vault, "--region", region])
+        return try Self.decoder().decode(LegacyJobList.self, from: data).jobs ?? []
+    }
+
+    public func startLegacyJob(vault: String, region: String, archiveID: String?, tier: String = "Standard") async throws -> String {
+        var parameters: [String: String] = ["Type": archiveID == nil ? "inventory-retrieval" : "archive-retrieval"]
+        if let archiveID { parameters["ArchiveId"] = archiveID; parameters["Tier"] = tier }
+        let body = try JSONSerialization.data(withJSONObject: parameters, options: [.sortedKeys])
+        let data = try await json(["glacier", "initiate-job", "--account-id", "-", "--vault-name", vault, "--region", region, "--job-parameters", String(decoding: body, as: UTF8.self)])
+        let result = try Self.decoder().decode(LegacyJobInitiated.self, from: data)
+        return result.jobId
+    }
+
+    public func legacyJobOutput(vault: String, region: String, job: LegacyJob, destination: URL) async throws {
+        let temporary = destination.deletingLastPathComponent().appendingPathComponent(".glacierdesk-\(UUID().uuidString).download")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        _ = try await run(["glacier", "get-job-output", "--account-id", "-", "--vault-name", vault, "--region", region, "--job-id", job.jobId, temporary.path])
+        try Task.checkCancellation()
+        let expectedSize = job.action == "ArchiveRetrieval" ? job.archiveSizeInBytes : job.inventorySizeInBytes
+        if let expectedSize, let actual = try FileManager.default.attributesOfItem(atPath: temporary.path)[.size] as? NSNumber, actual.int64Value != expectedSize {
+            throw AWSServiceError.commandFailed("Downloaded size does not match the Glacier job output. The destination was not replaced.")
+        }
+        if job.action == "ArchiveRetrieval" {
+            guard let expected = job.archiveSHA256TreeHash, !expected.isEmpty else { throw AWSServiceError.commandFailed("Glacier did not supply an archive checksum; download was not saved.") }
+            let actual = try await Task.detached(priority: .utility) { try glacierTreeHash(temporary) }.value
+            guard actual.caseInsensitiveCompare(expected) == .orderedSame else { throw AWSServiceError.commandFailed("Archive checksum mismatch. The destination was not replaced.") }
+        }
+        try Task.checkCancellation()
+        if FileManager.default.fileExists(atPath: destination.path) { _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary) }
+        else { try FileManager.default.moveItem(at: temporary, to: destination) }
+    }
+
+    public func uploadLegacyArchive(vault: String, region: String, file: URL) async throws -> String {
+        let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+        guard let size = attributes[.size] as? NSNumber, size.int64Value > 0, size.int64Value <= 4 * 1024 * 1024 * 1024 else {
+            throw AWSServiceError.commandFailed("Legacy single-request uploads support files from 1 byte to 4 GiB. Larger archives require multipart upload, which is not yet supported.")
+        }
+        let checksum = try await Task.detached(priority: .utility) { try glacierTreeHash(file) }.value
+        let description = String(file.lastPathComponent.unicodeScalars.map { (32...126).contains($0.value) ? Character($0) : "_" }.prefix(1024))
+        let data = try await json(["glacier", "upload-archive", "--account-id", "-", "--vault-name", vault, "--region", region, "--archive-description", description, "--checksum", checksum, "--body", file.path])
+        return try Self.decoder().decode(LegacyUploadResult.self, from: data).archiveId
     }
 
     /// Fetches one S3 page. Pass `nextContinuationToken` from the prior result to continue.
@@ -311,6 +356,41 @@ public struct LegacyVault: Decodable, Sendable, Identifiable {
         case vaultName = "VaultName", vaultARN = "VaultARN", lastInventoryDate = "LastInventoryDate"
         case numberOfArchives = "NumberOfArchives", sizeInBytes = "SizeInBytes"
     }
+}
+public struct LegacyJob: Decodable, Sendable, Identifiable {
+    public let jobId: String
+    public let action: String?
+    public let statusCode: String?
+    public let archiveId: String?
+    public let creationDate: String?
+    public let archiveSizeInBytes: Int64?
+    public let inventorySizeInBytes: Int64?
+    public let archiveSHA256TreeHash: String?
+    public var id: String { jobId }
+    enum CodingKeys: String, CodingKey {
+        case jobId = "JobId", action = "Action", statusCode = "StatusCode", archiveId = "ArchiveId", creationDate = "CreationDate"
+        case archiveSizeInBytes = "ArchiveSizeInBytes", inventorySizeInBytes = "InventorySizeInBytes", archiveSHA256TreeHash = "ArchiveSHA256TreeHash"
+    }
+}
+private struct LegacyJobList: Decodable { let jobs: [LegacyJob]?; enum CodingKeys: String, CodingKey { case jobs = "JobList" } }
+private struct LegacyJobInitiated: Decodable { let jobId: String }
+private struct LegacyUploadResult: Decodable { let archiveId: String }
+
+private func glacierTreeHash(_ url: URL) throws -> String {
+    let file = try FileHandle(forReadingFrom: url)
+    defer { try? file.close() }
+    var stack: [(Int, Data)] = []
+    while let bytes = try file.read(upToCount: 1_048_576), !bytes.isEmpty {
+        var level = 0
+        var hash = Data(SHA256.hash(data: bytes))
+        while let last = stack.last, last.0 == level {
+            stack.removeLast(); hash = Data(SHA256.hash(data: last.1 + hash)); level += 1
+        }
+        stack.append((level, hash))
+    }
+    guard var hash = stack.popLast()?.1 else { return SHA256.hash(data: Data()).map { String(format: "%02x", $0) }.joined() }
+    while let left = stack.popLast() { hash = Data(SHA256.hash(data: left.1 + hash)) }
+    return hash.map { String(format: "%02x", $0) }.joined()
 }
 private struct LegacyVaultPage: Decodable {
     let vaults: [LegacyVault]?

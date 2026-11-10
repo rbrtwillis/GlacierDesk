@@ -11,13 +11,15 @@ Version 0.1 is an early SwiftUI development checkpoint (the app bundle reports `
 - Transfer progress, cancellation and manual retry; restore requests and locally saved restore status for S3 Glacier Flexible Retrieval and Deep Archive.
 - A preview and confirmation workflow for an incomplete-multipart-upload lifecycle rule, preserving existing rules in the proposed configuration.
 - Native light and dark appearances.
-- Read-only listing of legacy Amazon Glacier vaults in a selected AWS Region.
+- Legacy Amazon Glacier vault listing, inventory browsing, archive retrieval jobs, verified downloads, and single-file uploads up to 4 GiB.
 
-This version does not support folder uploads, deletion, legacy vault archive browsing or transfers, resumable transfers across restarts, or automatic discovery of restore requests made outside the app. Restore requests use a three-day temporary copy. Live AWS end-to-end validation and accessibility review remain outstanding.
+This version does not support folder uploads, deletion, multipart uploads to legacy vaults, resumable transfers across restarts, or automatic discovery of S3 restore requests made outside the app. S3 restore requests use a three-day temporary copy. Live AWS end-to-end validation and accessibility review remain outstanding.
 
 In the object list, use Command-click or Shift-click to select multiple objects, then choose **Download selected** and a destination folder. Existing local files are skipped; archived objects without a completed restore and failed downloads are reported in Activity. Batch downloads run sequentially.
 
-To find older Glacier vaults, connect a profile, select **Legacy vaults**, choose the Region where the vaults were created, and choose **Find vaults**. Vault metadata is based on the last inventory and the identity needs `glacier:ListVaults` permission. Vaults are a separate AWS service, so they do not appear in the S3 bucket list. Listing vaults does not start an inventory retrieval job.
+To find older Glacier vaults, connect a profile, select **Legacy vaults**, choose the Region where the vaults were created, and choose **Find vaults**. Open a vault to request an inventory or archive retrieval, refresh AWS jobs, open a completed inventory, search archives, or download a completed archive retrieval. You can also enter an archive ID directly or upload a single file up to 4 GiB. Archive IDs returned by uploads are saved locally; keep an independent copy. Vault inventories can take hours to prepare, reflect the last inventory rather than live contents, and may be large. Glacier job output is available for a limited time after completion. Retrieval, storage, requests and data transfer may incur AWS charges.
+
+The identity needs the relevant `glacier:ListVaults`, `glacier:ListJobs`, `glacier:InitiateJob`, `glacier:GetJobOutput`, and `glacier:UploadArchive` permissions for the actions used. Vaults are a separate AWS service and do not appear in the S3 bucket list. Listing vaults does not start an inventory retrieval job. Downloads check the archive's Glacier tree hash before replacing a local file. If a job or upload request times out, its outcome may be unknown: check jobs or inventory before retrying to avoid duplicate charges or archives. Legacy operations have not yet been validated against a live vault.
 
 ## Build locally
 

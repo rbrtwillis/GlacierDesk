@@ -22,8 +22,17 @@ struct LegacyVaultView: View {
     @State private var loadedRegion: String?
     @State private var error: String?
     @State private var busy = false
+    @State private var selectedVault: LegacyVault?
 
     var body: some View {
+        if let vault = selectedVault, let loadedRegion {
+            LegacyVaultDetailView(profile: profile, region: loadedRegion, vault: vault) { selectedVault = nil }
+        } else {
+            vaultList
+        }
+    }
+
+    private var vaultList: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 14) {
             Text("Legacy Glacier vaults").font(.title2.weight(.semibold))
@@ -54,13 +63,14 @@ struct LegacyVaultView: View {
                         Text("Archives: \(vault.numberOfArchives.map(String.init) ?? "—") · Size: \(vault.sizeInBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "—")")
                             .font(.caption).foregroundStyle(.secondary)
                         Text("Last inventory: \(vault.lastInventoryDate ?? "Not available")").font(.caption).foregroundStyle(.secondary)
+                        Button("Open vault") { selectedVault = vault }
                     }.padding(.vertical, 6)
                 }
                 }
             } else {
                 Text("Choose the Region where your vaults were created and select Find vaults.").foregroundStyle(.secondary).padding(.vertical, 20)
             }
-            Text("Vault counts reflect the last inventory. Archive browsing, retrieval, and uploads for legacy vaults are not yet supported.")
+            Text("Vault counts reflect the last inventory. Opening a vault lets you request an inventory, browse archives, and manage retrieval jobs.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(20).frame(maxWidth: .infinity, alignment: .topLeading)
         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

@@ -379,7 +379,7 @@ struct ContentView: View {
                 Label("Browse", systemImage: "externaldrive").tag("Browse")
                 Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
                 Label("Restores", systemImage: "archivebox").tag("Restores")
-                Label("Legacy vaults", systemImage: "externaldrive.badge.clock").tag("Vaults")
+                Label("Legacy vaults", systemImage: "archivebox.fill").tag("Vaults")
             }.listStyle(.sidebar).frame(minHeight: 150, maxHeight: 190)
 
             VStack(alignment: .leading, spacing: 4) {
