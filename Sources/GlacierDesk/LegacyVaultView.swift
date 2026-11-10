@@ -17,6 +17,7 @@ struct LegacyVaultView: View {
         ("us-gov-east-1", "AWS GovCloud (US-East)"), ("us-gov-west-1", "AWS GovCloud (US-West)")
     ]
     let profile: String
+    @Binding var externalBusy: Bool
     @AppStorage("legacyVaultRegion") private var region = "us-east-1"
     @State private var vaults: [LegacyVault] = []
     @State private var loadedRegion: String?
@@ -26,7 +27,7 @@ struct LegacyVaultView: View {
 
     var body: some View {
         if let vault = selectedVault, let loadedRegion {
-            LegacyVaultDetailView(profile: profile, region: loadedRegion, vault: vault) { selectedVault = nil }
+            LegacyVaultDetailView(profile: profile, region: loadedRegion, vault: vault, externalBusy: $externalBusy) { selectedVault = nil }
         } else {
             vaultList
         }

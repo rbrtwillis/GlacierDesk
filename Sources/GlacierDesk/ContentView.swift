@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct RestoreRecord: Codable, Identifiable {
     var id = UUID()
@@ -35,6 +36,7 @@ final class GlacierDeskModel: ObservableObject {
     @Published var restores: [RestoreRecord] = []
     @Published var transferProgress: Double?
     @Published var transferStatus: String?
+    @Published var uploadQueue: [QueuedUpload] = []
     private var transferTask: Task<Void, Never>?
     private var retryTransfer: (() -> Void)?
     @AppStorage("restoreRecords") private var restoreData = Data()
@@ -75,6 +77,55 @@ final class GlacierDeskModel: ObservableObject {
             let access = url.startAccessingSecurityScopedResource()
             defer { if access { url.stopAccessingSecurityScopedResource() }; transferTask = nil }
             await upload(url)
+        }
+    }
+    func startFolderUpload(_ plan: FolderUploadPlan) {
+        guard transferTask == nil, !isBusy, identity != nil, connectedProfile == plan.profile,
+              selectedBucket?.name == plan.bucket, prefix == plan.prefix else {
+            errorMessage = "The selected account or destination changed. Prepare the upload again."
+            return
+        }
+        let access = plan.roots.map { ($0, $0.startAccessingSecurityScopedResource()) }
+        let uploadService = AWSService(profile: plan.profile)
+        uploadQueue = plan.items.map { QueuedUpload(item: $0) }
+        retryTransfer = nil
+        isBusy = true
+        transferTask = Task { [self] in
+            defer {
+                for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() }
+                isBusy = false; transferTask = nil
+            }
+            var succeeded = 0, failed = 0
+            for index in plan.items.indices {
+                if Task.isCancelled { break }
+                let item = plan.items[index]
+                uploadQueue[index].state = "Preparing secure snapshot"
+                transferStatus = "Uploading \(index + 1) of \(plan.items.count): \(item.key)"
+                transferProgress = Double(index) / Double(plan.items.count)
+                do {
+                    let snapshot = try await item.snapshot()
+                    defer { try? FileManager.default.removeItem(at: snapshot.deletingLastPathComponent()) }
+                    uploadQueue[index].state = "Uploading"
+                    try await uploadService.upload(fileURL: snapshot, bucket: plan.bucket, key: item.key,
+                                                   storageClass: plan.storageClass, settings: plan.settings,
+                                                   progress: { [weak self] fraction in
+                        Task { @MainActor in self?.transferProgress = (Double(index) + fraction) / Double(plan.items.count) }
+                    })
+                    uploadQueue[index].state = "Complete"; succeeded += 1
+                } catch {
+                    if Task.isCancelled { uploadQueue[index].state = "Cancelled"; break }
+                    uploadQueue[index].state = "Failed: \(error.localizedDescription)"; failed += 1
+                }
+            }
+            if Task.isCancelled {
+                for index in uploadQueue.indices where uploadQueue[index].state == "Queued" { uploadQueue[index].state = "Cancelled" }
+                transferProgress = nil
+                transferStatus = "Cancelled: \(succeeded) uploaded, \(failed) failed. Incomplete multipart parts may remain in S3."
+            } else {
+                transferProgress = 1
+                transferStatus = "Upload queue finished: \(succeeded) uploaded, \(failed) failed."
+            }
+            activity.insert("Folder upload: \(succeeded) uploaded, \(failed) failed to \(plan.bucket)", at: 0)
         }
     }
     func startDownload(_ object: AWSObject, to destination: URL) {
@@ -252,6 +303,11 @@ struct ContentView: View {
     @State private var showTransferSettings = false
     @State private var showLifecycle = false
     @State private var selectedKeys: Set<String> = []
+    @State private var folderPlan: FolderUploadPlan?
+    @State private var showFolderReview = false
+    @State private var folderScopes: [URL] = []
+    @State private var preparingDrop = false
+    @State private var dropTargeted = false
 
     var body: some View {
         NavigationSplitView {
@@ -264,7 +320,7 @@ struct ContentView: View {
                 case "Activity": activityView
                 case "Restores": restoresView
                 case "Vaults":
-                    if let profile = model.connectedProfile { LegacyVaultView(profile: profile) }
+                    if let profile = model.connectedProfile { LegacyVaultView(profile: profile, externalBusy: $model.isBusy) }
                     else { EmptyState(title: "Connect to AWS", icon: "link", detail: "Connect a profile to find legacy Glacier vaults.") }
                 default: browser
                 }
@@ -283,6 +339,9 @@ struct ContentView: View {
             if let bucket = model.selectedBucket, let account = model.identity?.account, let profile = model.connectedProfile {
                 LifecycleView(service: AWSService(profile: profile), bucket: bucket.name, account: account)
             }
+        }
+        .sheet(isPresented: $showFolderReview, onDismiss: releaseFolderScopes) {
+            if let plan = folderPlan { folderReview(plan) }
         }
         .tint(GlacierTheme.accent)
         .task {
@@ -380,7 +439,7 @@ struct ContentView: View {
                 Label("Activity", systemImage: "clock.arrow.circlepath").tag("Activity")
                 Label("Restores", systemImage: "archivebox").tag("Restores")
                 Label("Legacy vaults", systemImage: "archivebox.fill").tag("Vaults")
-            }.listStyle(.sidebar).frame(minHeight: 150, maxHeight: 190)
+            }.listStyle(.sidebar).frame(minHeight: 150, maxHeight: 190).disabled(model.isBusy)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack { Text("BUCKETS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
@@ -408,7 +467,7 @@ struct ContentView: View {
                 }
             }.padding(.horizontal, 14)
             Spacer(minLength: 4)
-            Text("AWS CLI profile selection is explicit. Legacy vault listing is read-only.")
+            Text("AWS CLI profile selection is explicit. Choose a vault to manage its archives.")
                 .font(.caption2).foregroundStyle(.tertiary).padding(14)
         }
         .frame(minWidth: 250, idealWidth: 320)
@@ -467,6 +526,14 @@ struct ContentView: View {
                 }
             }
         }
+        .overlay(alignment: .bottom) {
+            if model.identity != nil && model.selectedBucket != nil {
+                Text(dropTargeted ? "Drop to prepare upload" : "Drag files or folders here to upload")
+                    .font(.caption).padding(8).background(.regularMaterial, in: Capsule()).padding(10)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: acceptDrop)
     }
 
     private var welcome: some View {
@@ -594,12 +661,94 @@ struct ContentView: View {
                 }.padding(16)
                 Divider()
             }
+            if !model.uploadQueue.isEmpty {
+                Text("Upload queue").font(.headline).padding(.horizontal, 20).padding(.top, 12)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.uploadQueue) { entry in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.item.key).font(.callout).textSelection(.enabled)
+                                Text(entry.state).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }.padding(16)
+                }.frame(maxHeight: 300)
+                Divider()
+            }
             if model.activity.isEmpty {
                 EmptyState(title: "No activity yet", icon: "clock.arrow.circlepath", detail: "Uploads, downloads, and restore requests will appear here.")
             } else {
                 List(model.activity, id: \.self) { item in Label(item, systemImage: "checkmark.circle").padding(.vertical, 5) }.listStyle(.plain)
             }
         }
+    }
+
+    private func folderReview(_ plan: FolderUploadPlan) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Review upload queue").font(.title2.weight(.semibold))
+            Text("\(plan.items.count) files → s3://\(plan.bucket)/\(plan.prefix)").textSelection(.enabled)
+            Text("Storage class: \(plan.storageClass) · Multipart threshold: \(plan.settings.thresholdMiB) MiB · Part size: \(plan.settings.partSizeMiB) MiB · Parallel requests: \(plan.settings.connections)").font(.caption)
+            Text("Folders and subfolders are preserved. Existing objects with the same keys will be replaced; storage and request charges may apply. Empty folders and symbolic links are skipped. Each file is copied to private temporary storage before upload.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            List(plan.items) { item in Text(item.key).font(.caption.monospaced()).textSelection(.enabled) }
+            HStack {
+                Spacer()
+                Button("Cancel") { showFolderReview = false }
+                Button("Upload \(plan.items.count) files") {
+                    model.startFolderUpload(plan)
+                    showFolderReview = false
+                    selectedSection = "Activity"
+                }.buttonStyle(.borderedProminent)
+            }
+        }.padding(20).frame(width: 680, height: 520)
+    }
+
+    private func releaseFolderScopes() {
+        for url in folderScopes { url.stopAccessingSecurityScopedResource() }
+        folderScopes = []
+        folderPlan = nil
+    }
+
+    private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard selectedSection == "Browse", model.identity != nil, let bucket = model.selectedBucket?.name,
+              let profile = model.connectedProfile, !model.isBusy, !preparingDrop else { return false }
+        let prefix = model.prefix, storageClass = model.storageClass
+        var settings = UploadSettings()
+        settings.thresholdMiB = model.uploadThresholdMiB
+        settings.partSizeMiB = model.uploadPartSizeMiB
+        settings.connections = model.uploadConnections
+        preparingDrop = true
+        Task { @MainActor in
+            defer { preparingDrop = false }
+            do {
+                var roots: [URL] = []
+                for provider in providers {
+                    let url: URL = try await withCheckedThrowingContinuation { continuation in
+                        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                            if let error { continuation.resume(throwing: error); return }
+                            if let url = item as? URL { continuation.resume(returning: url); return }
+                            if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) { continuation.resume(returning: url); return }
+                            continuation.resume(throwing: FolderUploadError.message("Could not read a Finder item."))
+                        }
+                    }
+                    guard url.isFileURL else { throw FolderUploadError.message("Only local files and folders can be uploaded.") }
+                    roots.append(url)
+                    if url.startAccessingSecurityScopedResource() { folderScopes.append(url) }
+                }
+                let plan = try await Task.detached(priority: .userInitiated) {
+                    try FolderUploadPlan.build(roots: roots, bucket: bucket, prefix: prefix, profile: profile, storageClass: storageClass, settings: settings)
+                }.value
+                guard model.connectedProfile == profile, model.selectedBucket?.name == bucket, model.prefix == prefix, !model.isBusy else {
+                    throw FolderUploadError.message("The destination changed while preparing the queue. Drop the folder again.")
+                }
+                folderPlan = plan
+                showFolderReview = true
+            } catch {
+                releaseFolderScopes()
+                model.errorMessage = error.localizedDescription
+            }
+        }
+        return true
     }
 
     private var restoresView: some View {

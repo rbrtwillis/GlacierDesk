@@ -4,7 +4,7 @@ Copyright © 2026 WillisLabs.ai. Licensed under the Apache License, Version 2.0.
 
 ## Current checkpoint
 
-GlacierDesk 0.1 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, individual file uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, archive browsing, verified downloads, and single-file uploads up to 4 GiB. Legacy multipart uploads and live-vault validation remain outstanding.
+GlacierDesk 0.1 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, archive browsing, verified downloads, and file and folder uploads with multipart support. Live-vault validation remains outstanding.
 
 Uploads have configurable multipart settings. The Activity view provides progress, cancellation, and manual retry; retry restarts the transfer, and active transfers do not survive app restarts. Downloads use a temporary destination before replacing the final file. Restore requests made by the app are stored locally and refreshed for the matching account and profile while the app runs; the current restore duration is three days.
 
@@ -21,7 +21,7 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 1. Validate browse, upload, download, restore, and lifecycle flows against a dedicated AWS account and bucket, including permissions, SSO expiration, interruptions, and cost behavior.
 2. Add automated integration and unit tests, including redaction, profile isolation, lifecycle preservation, concurrency, transfer cancellation, and restore status across restarts.
-3. Improve transfers with durable queueing, robust recovery, resumable multipart operations and cleanup, clearer progress and errors, and folder uploads.
+3. Improve transfers with durable queueing, robust recovery, resumable multipart operations and cleanup, and clearer progress and errors.
 4. Improve restores with configurable duration, clearer expiration and status, recovery after interrupted submissions, and discovery or import of externally initiated requests.
 5. Complete accessibility and light/dark appearance review, security review, dependency and secret scanning, CI, signing, notarization, and distribution.
 

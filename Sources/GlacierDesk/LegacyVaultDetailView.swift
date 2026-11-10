@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct VaultInventory: Decodable {
     let InventoryDate: String?
@@ -24,6 +25,7 @@ struct LegacyVaultDetailView: View {
     let profile: String
     let region: String
     let vault: LegacyVault
+    @Binding var externalBusy: Bool
     let back: () -> Void
     @State private var jobs: [LegacyJob] = []
     @State private var inventory: [VaultArchive] = []
@@ -39,6 +41,17 @@ struct LegacyVaultDetailView: View {
     @State private var showingFilePicker = false
     @State private var uploadFile: URL?
     @AppStorage("legacyUploadedArchives") private var uploadedData = Data()
+    @AppStorage("uploadThresholdMiB") private var uploadThresholdMiB = 64
+    @AppStorage("uploadPartSizeMiB") private var uploadPartSizeMiB = 16
+    @AppStorage("uploadConnections") private var uploadConnections = 4
+    @State private var folderPlan: FolderUploadPlan?
+    @State private var folderScopes: [URL] = []
+    @State private var showFolderReview = false
+    @State private var preparingDrop = false
+    @State private var dropTargeted = false
+    @State private var uploadQueue: [QueuedUpload] = []
+    @State private var queueTask: Task<Void, Never>?
+    @State private var queueProgress: Double = 0
     private var service: AWSService { AWSService(profile: profile) }
 
     var body: some View {
@@ -54,6 +67,18 @@ struct LegacyVaultDetailView: View {
                     Button("Refresh jobs") { Task { await refresh() } }.disabled(busy)
                     Button("Upload archive…") { showingFilePicker = true }.disabled(busy)
                     if busy { ProgressView().controlSize(.small) }
+                }
+                Text(dropTargeted ? "Drop to prepare upload" : "Drag files or folders from Finder here to prepare an upload queue.")
+                    .font(.caption).foregroundStyle(GlacierTheme.accent)
+                if !uploadQueue.isEmpty {
+                    ProgressView(value: queueProgress)
+                    if queueTask != nil { Button("Cancel queue") { queueTask?.cancel() } }
+                    ForEach(uploadQueue) { entry in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.item.key).font(.caption.monospaced()).textSelection(.enabled)
+                            Text(entry.state).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                    }
                 }
                 if let status { Text(status).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 Divider()
@@ -109,6 +134,12 @@ struct LegacyVaultDetailView: View {
                 Link("AWS Glacier pricing", destination: URL(string: "https://aws.amazon.com/s3/pricing/")!)
             }.padding(20).frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: acceptDrop)
+        .onChange(of: busy) { externalBusy = $0 }
+        .onDisappear { externalBusy = false }
+        .sheet(isPresented: $showFolderReview, onDismiss: releaseFolderScopes) {
+            if let plan = folderPlan { folderReview(plan) }
+        }
         .task { await refresh() }
         .fileImporter(isPresented: $showingFilePicker, allowedContentTypes: [.item]) { result in
             switch result {
@@ -127,7 +158,7 @@ struct LegacyVaultDetailView: View {
         .confirmationDialog("Upload archive?", isPresented: $confirmUpload, titleVisibility: .visible) {
             Button("Upload") { if let file = uploadFile { Task { await upload(file) } } }
             Button("Cancel", role: .cancel) { uploadFile = nil }
-        } message: { Text("Storage and request charges apply. Single-file uploads are limited to 4 GiB. Save the returned archive ID.") }
+        } message: { Text("Storage and request charges apply. Multipart uploads use the configured transfer settings. Save the returned archive ID.") }
     }
 
     @MainActor private func refresh() async {
@@ -177,12 +208,106 @@ struct LegacyVaultDetailView: View {
         let access = file.startAccessingSecurityScopedResource()
         defer { if access { file.stopAccessingSecurityScopedResource() } }
         do {
-            let id = try await service.uploadLegacyArchive(vault: vault.vaultName, region: region, file: file)
-            var saved = (try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []
-            saved.insert(SavedLegacyUpload(id: id, profile: profile, region: region, vault: vault.vaultName, filename: file.lastPathComponent), at: 0)
-            if let data = try? JSONEncoder().encode(saved) { uploadedData = data }
+            var settings = UploadSettings(); settings.thresholdMiB = uploadThresholdMiB; settings.partSizeMiB = uploadPartSizeMiB; settings.connections = uploadConnections
+            let id = try await service.uploadLegacyArchive(vault: vault.vaultName, region: region, file: file, settings: settings)
+            saveUpload(id: id, filename: file.lastPathComponent)
             status = "Upload complete. Archive ID (also saved on this Mac): \(id)"
         }
         catch { status = "Upload failed or its result is unknown: \(error.localizedDescription). Check your vault inventory before retrying to avoid a duplicate." }
+    }
+
+    @MainActor private func saveUpload(id: String, filename: String) {
+        var saved = (try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []
+        saved.insert(SavedLegacyUpload(id: id, profile: profile, region: region, vault: vault.vaultName, filename: filename), at: 0)
+        if let data = try? JSONEncoder().encode(saved) { uploadedData = data }
+    }
+
+    private func folderReview(_ plan: FolderUploadPlan) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Review legacy vault upload").font(.title2.weight(.semibold))
+            Text("\(plan.items.count) archives → \(vault.vaultName) · \(region)")
+            Text("Threshold: \(plan.settings.thresholdMiB) MiB · Part size: \(plan.settings.partSizeMiB) MiB · Parallel requests: \(plan.settings.connections)").font(.caption)
+            Text("Legacy Glacier stores independent archives, not folders. Paths are stored as archive descriptions; non-ASCII characters are replaced and descriptions are limited to 1,024 bytes. Parts are rounded up to a supported power-of-two size. Private snapshots and parallel parts require temporary disk space. Uploads incur AWS charges; empty files, folders and symbolic links are not supported.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            List(plan.items) { item in Text(item.key).font(.caption.monospaced()).textSelection(.enabled) }
+            HStack {
+                Spacer()
+                Button("Cancel") { showFolderReview = false }
+                Button("Upload \(plan.items.count) files") { startFolderUpload(plan); showFolderReview = false }.buttonStyle(.borderedProminent)
+            }
+        }.padding(20).frame(width: 680, height: 520)
+    }
+
+    @MainActor private func releaseFolderScopes() {
+        for url in folderScopes { url.stopAccessingSecurityScopedResource() }
+        folderScopes = []; folderPlan = nil
+    }
+
+    private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard !busy, !preparingDrop else { return false }
+        var settings = UploadSettings(); settings.thresholdMiB = uploadThresholdMiB; settings.partSizeMiB = uploadPartSizeMiB; settings.connections = uploadConnections
+        preparingDrop = true
+        Task { @MainActor in
+            defer { preparingDrop = false }
+            do {
+                var roots: [URL] = []
+                for provider in providers {
+                    let url: URL = try await withCheckedThrowingContinuation { continuation in
+                        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                            if let error { continuation.resume(throwing: error); return }
+                            if let url = item as? URL { continuation.resume(returning: url); return }
+                            if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) { continuation.resume(returning: url); return }
+                            continuation.resume(throwing: FolderUploadError.message("Could not read a Finder item."))
+                        }
+                    }
+                    guard url.isFileURL else { throw FolderUploadError.message("Only local files and folders can be uploaded.") }
+                    roots.append(url)
+                    if url.startAccessingSecurityScopedResource() { folderScopes.append(url) }
+                }
+                let plan = try await Task.detached(priority: .userInitiated) {
+                    try FolderUploadPlan.build(roots: roots, bucket: vault.vaultName, prefix: "", profile: profile, storageClass: "Legacy Glacier", settings: settings)
+                }.value
+                guard !busy else { throw FolderUploadError.message("The vault is busy. Drop the folder again when it is ready.") }
+                folderPlan = plan; showFolderReview = true
+            } catch { releaseFolderScopes(); status = error.localizedDescription }
+        }
+        return true
+    }
+
+    @MainActor private func startFolderUpload(_ plan: FolderUploadPlan) {
+        guard !busy, queueTask == nil else { status = "The vault is busy. Prepare the upload again."; return }
+        let access = plan.roots.map { ($0, $0.startAccessingSecurityScopedResource()) }
+        let uploadService = service
+        uploadQueue = plan.items.map { QueuedUpload(item: $0) }
+        queueProgress = 0; busy = true
+        queueTask = Task { @MainActor in
+            defer {
+                for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() }
+                busy = false; queueTask = nil
+            }
+            var completed = 0, failed = 0
+            for index in plan.items.indices {
+                if Task.isCancelled { break }
+                let item = plan.items[index]
+                uploadQueue[index].state = "Hashing / uploading"
+                status = "Uploading \(index + 1) of \(plan.items.count): \(item.key)"
+                queueProgress = Double(index) / Double(plan.items.count)
+                do {
+                    let snapshot = try await item.snapshot()
+                    defer { try? FileManager.default.removeItem(at: snapshot.deletingLastPathComponent()) }
+                    let id = try await uploadService.uploadLegacyArchive(vault: vault.vaultName, region: region, file: snapshot, description: item.key, settings: plan.settings,
+                        progress: { fraction in Task { @MainActor in queueProgress = (Double(index) + fraction) / Double(plan.items.count) } })
+                    saveUpload(id: id, filename: item.key)
+                    uploadQueue[index].state = "Complete · Archive ID: \(id)"; completed += 1
+                } catch {
+                    uploadQueue[index].state = "\(Task.isCancelled ? "Cancelled" : "Failed"): \(error.localizedDescription)"
+                    if Task.isCancelled { break }; failed += 1
+                }
+            }
+            if Task.isCancelled {
+                for index in uploadQueue.indices where uploadQueue[index].state == "Queued" { uploadQueue[index].state = "Cancelled" }
+                status = "Queue cancelled: \(completed) uploaded, \(failed) failed. Review any incomplete-upload messages."
+            } else { queueProgress = 1; status = "Queue finished: \(completed) uploaded, \(failed) failed." }
+        }
     }
 }
