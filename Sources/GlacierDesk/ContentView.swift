@@ -308,6 +308,7 @@ struct ContentView: View {
     @State private var folderScopes: [URL] = []
     @State private var preparingDrop = false
     @State private var dropTargeted = false
+    @AppStorage("bucketsExpanded") private var bucketsExpanded = true
 
     var body: some View {
         NavigationSplitView {
@@ -442,9 +443,22 @@ struct ContentView: View {
             }.listStyle(.sidebar).frame(minHeight: 150, maxHeight: 190).disabled(model.isBusy)
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack { Text("BUCKETS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                    Spacer(); if model.isBusy { ProgressView().controlSize(.small) } }
-                if model.identity == nil {
+                HStack {
+                    Button { bucketsExpanded.toggle() } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: bucketsExpanded ? "chevron.down" : "chevron.right")
+                            Text("BUCKETS")
+                            Spacer()
+                        }.font(.caption2.weight(.semibold)).foregroundStyle(.secondary).contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                        .accessibilityLabel("Buckets")
+                        .accessibilityValue(bucketsExpanded ? "Expanded" : "Collapsed")
+                        .help(bucketsExpanded ? "Collapse buckets" : "Expand buckets")
+                    if model.isBusy { ProgressView().controlSize(.small) }
+                }
+                if !bucketsExpanded {
+                    EmptyView()
+                } else if model.identity == nil {
                     Text("Connect to load buckets.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
                 } else if model.buckets.isEmpty {
                     Text("No buckets available.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
