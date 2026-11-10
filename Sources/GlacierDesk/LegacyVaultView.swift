@@ -1,6 +1,21 @@
 import SwiftUI
 
 struct LegacyVaultView: View {
+    // AWS General Reference: Amazon Glacier service endpoints.
+    private let regions: [(code: String, name: String)] = [
+        ("us-east-1", "US East (N. Virginia)"), ("us-east-2", "US East (Ohio)"),
+        ("us-west-1", "US West (N. California)"), ("us-west-2", "US West (Oregon)"),
+        ("af-south-1", "Africa (Cape Town)"), ("ap-east-1", "Asia Pacific (Hong Kong)"),
+        ("ap-southeast-3", "Asia Pacific (Jakarta)"), ("ap-south-1", "Asia Pacific (Mumbai)"),
+        ("ap-northeast-3", "Asia Pacific (Osaka)"), ("ap-northeast-2", "Asia Pacific (Seoul)"),
+        ("ap-southeast-1", "Asia Pacific (Singapore)"), ("ap-southeast-2", "Asia Pacific (Sydney)"),
+        ("ap-northeast-1", "Asia Pacific (Tokyo)"), ("ca-central-1", "Canada (Central)"),
+        ("eu-central-1", "Europe (Frankfurt)"), ("eu-west-1", "Europe (Ireland)"),
+        ("eu-west-2", "Europe (London)"), ("eu-south-1", "Europe (Milan)"),
+        ("eu-west-3", "Europe (Paris)"), ("eu-north-1", "Europe (Stockholm)"),
+        ("me-south-1", "Middle East (Bahrain)"), ("sa-east-1", "South America (São Paulo)"),
+        ("us-gov-east-1", "AWS GovCloud (US-East)"), ("us-gov-west-1", "AWS GovCloud (US-West)")
+    ]
     let profile: String
     @AppStorage("legacyVaultRegion") private var region = "us-east-1"
     @State private var vaults: [LegacyVault] = []
@@ -15,8 +30,14 @@ struct LegacyVaultView: View {
             Text("Vaults belong to the older Amazon Glacier service and are listed one AWS Region at a time. They are separate from S3 buckets.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
-                Text("AWS Region")
-                TextField("e.g. us-east-1", text: $region).textFieldStyle(.roundedBorder).frame(width: 180)
+                Picker("AWS Region", selection: $region) {
+                    if !regions.contains(where: { $0.code == region }) {
+                        Text("\(region) (previously selected)").tag(region)
+                    }
+                    ForEach(regions, id: \.code) { item in
+                        Text("\(item.name) — \(item.code)").tag(item.code)
+                    }
+                }.frame(width: 370).disabled(busy)
                 Button("Find vaults") { Task { await load() } }.disabled(busy || region.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 if busy { ProgressView().controlSize(.small) }
                 Spacer()
@@ -37,7 +58,7 @@ struct LegacyVaultView: View {
                 }
                 }
             } else {
-                Text("Enter the Region where your vaults were created and select Find vaults.").foregroundStyle(.secondary).padding(.vertical, 20)
+                Text("Choose the Region where your vaults were created and select Find vaults.").foregroundStyle(.secondary).padding(.vertical, 20)
             }
             Text("Vault counts reflect the last inventory. Archive browsing, retrieval, and uploads for legacy vaults are not yet supported.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

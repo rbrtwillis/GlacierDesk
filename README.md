@@ -17,7 +17,7 @@ This version does not support folder uploads, deletion, legacy vault archive bro
 
 In the object list, use Command-click or Shift-click to select multiple objects, then choose **Download selected** and a destination folder. Existing local files are skipped; archived objects without a completed restore and failed downloads are reported in Activity. Batch downloads run sequentially.
 
-To find older Glacier vaults, connect a profile, select **Legacy vaults**, enter the Region where the vaults were created, and choose **Find vaults**. Vault metadata is based on the last inventory and the identity needs `glacier:ListVaults` permission. Vaults are a separate AWS service, so they do not appear in the S3 bucket list. Listing vaults does not start an inventory retrieval job.
+To find older Glacier vaults, connect a profile, select **Legacy vaults**, choose the Region where the vaults were created, and choose **Find vaults**. Vault metadata is based on the last inventory and the identity needs `glacier:ListVaults` permission. Vaults are a separate AWS service, so they do not appear in the S3 bucket list. Listing vaults does not start an inventory retrieval job.
 
 ## Build locally
 
