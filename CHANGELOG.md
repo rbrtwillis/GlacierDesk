@@ -4,6 +4,12 @@ Notable user-visible changes are recorded here. Add new work under **Unreleased*
 
 ## Unreleased
 
+No changes recorded yet.
+
+## 0.2.0 — 2026-11-10
+
+### Added
+
 - Add a Resume control for reviewed pending or failed legacy uploads, with account and source checks.
 
 - Allow 1–16 concurrent legacy file uploads, each with its own configured multipart request limit.
@@ -23,10 +29,6 @@ Notable user-visible changes are recorded here. Add new work under **Unreleased*
 
 - Keep bucket root and parent-folder navigation available in the S3 browser, including inside empty folders.
 - Reconstruct a folder and file browser for legacy vault inventories, including encoded archive paths, with archive details available on demand.
-
-## 0.2.0 — 2026-11-10
-
-### Added
 
 - Automatic refresh of in-progress legacy Glacier jobs while the vault view is open, with optional completion notifications.
 - Account-scoped, streamed local inventory indexing with search, sorting, and pagination.
