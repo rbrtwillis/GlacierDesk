@@ -17,6 +17,10 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 - For upload settings, the app creates a private temporary copy of the AWS config and removes it after the transfer. The app does not intentionally save credentials in preferences or restore history.
 - Diagnostic redaction and credential isolation require further security review and testing. Use least-privilege IAM permissions and a dedicated test bucket for evaluation.
 
+## Queue follow-up
+
+- [ ] Allow an operator to review and clear selected legacy upload records marked `outcomeUnknown` from the local transfer queue. Show the archive path and known multipart upload ID, explain that clearing the local record does not abort or delete anything in AWS, and require an explicit acknowledgement before removing the record. Preserve the existing restriction against automatic retry of uncertain uploads; offer guidance for inspecting and cleaning up an incomplete multipart upload in the correct account, Region, and vault. Include individual and bulk selection tests and verify that other queue entries are unaffected.
+
 ## Next milestones
 
 1. Validate browse, upload, download, restore, and lifecycle flows against a dedicated AWS account and bucket, including permissions, SSO expiration, interruptions, and cost behavior.
