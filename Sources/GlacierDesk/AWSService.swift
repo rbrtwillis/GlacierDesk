@@ -167,13 +167,29 @@ public struct AWSService: Sendable {
 
     /// Fetches one S3 page. Pass `nextContinuationToken` from the prior result to continue.
     public func listObjects(bucket: String, prefix: String? = nil,
-                            continuationToken: String? = nil, maxKeys: Int = 1000) async throws -> AWSObjectPage {
-        var args = ["s3api", "list-objects-v2", "--bucket", bucket, "--delimiter", "/",
+                            continuationToken: String? = nil, maxKeys: Int = 1000, recursive: Bool = false) async throws -> AWSObjectPage {
+        var args = ["s3api", "list-objects-v2", "--bucket", bucket,
                     "--max-keys", String(max(1, min(maxKeys, 1000))), "--no-paginate"]
+        if !recursive { args += ["--delimiter", "/"] }
         if let prefix { args += ["--prefix", prefix] }
         if let continuationToken { args += ["--continuation-token", continuationToken] }
         let data = try await json(args)
         return try Self.decoder().decode(AWSObjectPage.self, from: data)
+    }
+
+    /// Lists all object keys under a prefix, including nested keys. AWS listing requests may incur charges.
+    public func listAllObjects(bucket: String, prefix: String) async throws -> [AWSObject] {
+        var result: [AWSObject] = [], token: String?
+        repeat {
+            try Task.checkCancellation()
+            let page = try await listObjects(bucket: bucket, prefix: prefix, continuationToken: token, recursive: true)
+            result.append(contentsOf: page.contents ?? [])
+            if page.isTruncated == true {
+                guard let next = page.nextContinuationToken, !next.isEmpty, next != token else { throw AWSServiceError.invalidResponse }
+                token = next
+            } else { token = nil }
+        } while token != nil
+        return result
     }
 
     public func headObject(bucket: String, key: String) async throws -> AWSObjectMetadata {

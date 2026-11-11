@@ -5,5 +5,8 @@ let package = Package(
     name: "GlacierDesk",
     platforms: [.macOS(.v13)],
     products: [.executable(name: "GlacierDesk", targets: ["GlacierDesk"])],
-    targets: [.executableTarget(name: "GlacierDesk")]
+    targets: [
+        .executableTarget(name: "GlacierDesk"),
+        .testTarget(name: "GlacierDeskTests", dependencies: ["GlacierDesk"])
+    ]
 )

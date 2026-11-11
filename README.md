@@ -1,8 +1,8 @@
-# GlacierDesk 0.1
+# GlacierDesk 0.2
 
 A native macOS app for browsing, uploading, restoring, and downloading Amazon S3 objects, with a focus on S3 Glacier storage classes.
 
-Version 0.1 is an early SwiftUI development checkpoint (the app bundle reports `0.1.0`). It uses the AWS CLI and existing AWS profiles. See [PLAN.md](PLAN.md) for current limitations and next milestones, and [DESIGN.md](DESIGN.md) for the visual identity.
+Version 0.2 is an early SwiftUI development checkpoint (the app bundle reports `0.2.0`). It uses the AWS CLI and existing AWS profiles. See [CHANGELOG.md](CHANGELOG.md) for release history, [PLAN.md](PLAN.md) for limitations and next milestones, and [DESIGN.md](DESIGN.md) for the visual identity.
 
 ## What's included
 
@@ -12,12 +12,14 @@ Version 0.1 is an early SwiftUI development checkpoint (the app bundle reports `
 - A preview and confirmation workflow for an incomplete-multipart-upload lifecycle rule, preserving existing rules in the proposed configuration.
 - Native light and dark appearances.
 - Legacy Amazon Glacier vault listing, inventory browsing, archive retrieval jobs, verified downloads, and multipart file and folder uploads.
+- Automatic refresh of in-progress legacy jobs while a vault is open, optional completion notifications, a locally indexed inventory browser, bulk retrieval, and a read-only migration comparison.
+- An in-app Help window and collapsible bucket list.
 
 This version does not support deletion, resumable transfers across restarts, or automatic discovery of S3 restore requests made outside the app. S3 restore requests use a three-day temporary copy. Live AWS end-to-end validation and accessibility review remain outstanding.
 
 To upload a folder, open an S3 bucket and prefix, or open a legacy Glacier vault, then drag files or folders from Finder into the main view. Review the destinations and charges before starting the queue. S3 preserves the folder path in the object key and can replace existing objects. Legacy Glacier stores each file as a separate archive; the relative path becomes the archive description, where non-ASCII characters are replaced. Empty folders and symbolic links are skipped; zero-byte legacy archives are not supported. Files upload sequentially, with the configured parallel request limit applied to the parts of each file. Legacy part sizes are rounded up to a supported power of two and may be increased for very large files.
 
-Each queued file is copied to a private temporary snapshot before upload, and legacy multipart uploads additionally create temporary part files. Ensure enough free disk space for a full file plus concurrent parts. The queue is not saved across app restarts. On cancellation or error, incomplete multipart parts can remain billable if abort is not confirmed; check AWS for cleanup. Legacy upload completion can have an unknown outcome after a network error, so check the vault before retrying to avoid duplicate archives.
+Each queued file is copied to a private temporary snapshot before upload, and legacy multipart uploads additionally create temporary part files. Ensure enough free disk space for a full file plus concurrent parts. Folder upload queue records persist locally; after reconnecting the original profile and account, eligible unfinished files can be reviewed and explicitly retried. Retrying starts a file again, not its completed multipart parts. An interrupted legacy upload with an unknown outcome cannot be retried automatically. On cancellation or error, incomplete multipart parts can remain billable if abort is not confirmed; check AWS for cleanup. Legacy upload completion can have an unknown outcome after a network error, so check the vault before retrying to avoid duplicate archives.
 
 In the object list, use Command-click or Shift-click to select multiple objects, then choose **Download selected** and a destination folder. Existing local files are skipped; archived objects without a completed restore and failed downloads are reported in Activity. Batch downloads run sequentially.
 
@@ -37,7 +39,7 @@ Use the sliders button in the toolbar to configure the multipart upload threshol
 
 To configure cleanup, select a bucket and click the lifecycle button in the toolbar. Choose the number of days and optionally a key prefix, then preview the entire proposed lifecycle configuration and confirm. An empty prefix applies to the entire bucket, including incomplete uploads created by other applications and uploads that already exist. GlacierDesk checks for configuration changes before writing, but S3 has no atomic compare-and-swap for this operation, so another change made between that check and the write could be overwritten. The selected account must own the bucket and have `s3:GetLifecycleConfiguration` and `s3:PutLifecycleConfiguration` permissions. Review existing rules and coordinate with other bucket administrators before applying.
 
-The Activity view shows transfer progress and offers cancellation and retry. Retry starts the transfer again; it does not resume individual multipart parts. Downloads use a temporary file and replace the destination only after a successful transfer. Transfers and retry actions do not survive an app restart.
+The Activity view shows transfer progress, saved S3 folder queues, cancellation, and explicit retry. Legacy vaults show their folder queue history in the vault view. Retry starts the file again; it does not resume individual multipart parts. Downloads use a temporary file and replace the destination only after a successful transfer. Active downloads and single-file transfers do not resume across app restarts.
 
 The Restores view saves requests made in GlacierDesk on this Mac and refreshes their S3 status when you connect and approximately once a minute while the app is open. Connect to the same profile and account to refresh a request. The S3 restore response includes an expiry date when a temporary copy is available. Requests initiated elsewhere are not automatically added to this list. If the app exits before a restore response is received, inspect the object in S3 before submitting another request.
 

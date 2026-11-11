@@ -1,12 +1,12 @@
-# GlacierDesk 0.1 status and roadmap
+# GlacierDesk 0.2 status and roadmap
 
 Copyright © 2026 WillisLabs.ai. Licensed under the Apache License, Version 2.0.
 
 ## Current checkpoint
 
-GlacierDesk 0.1 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, archive browsing, verified downloads, and file and folder uploads with multipart support. Live-vault validation remains outstanding.
+GlacierDesk 0.2 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, account-scoped local inventory indexing, verified downloads, and file and folder uploads with multipart support. Live-vault validation remains outstanding.
 
-Uploads have configurable multipart settings. The Activity view provides progress, cancellation, and manual retry; retry restarts the transfer, and active transfers do not survive app restarts. Downloads use a temporary destination before replacing the final file. Restore requests made by the app are stored locally and refreshed for the matching account and profile while the app runs; the current restore duration is three days.
+Uploads have configurable multipart settings. Folder queue records persist across restarts and eligible files can be explicitly retried after reconnecting the original account; retries restart files rather than resuming uploaded parts. Unknown legacy upload outcomes require manual inspection. Downloads use a temporary destination before replacing the final file. Restore requests made by the app are stored locally and refreshed for the matching account and profile while the app runs; the current restore duration is three days.
 
 The lifecycle workflow previews all rules and checks for intervening changes before writing. S3 replaces the full configuration without an atomic compare-and-swap, so a concurrent update after that check can still be overwritten. The current implementation requires the connected account to own the bucket.
 

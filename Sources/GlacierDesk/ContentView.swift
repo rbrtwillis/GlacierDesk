@@ -37,6 +37,7 @@ final class GlacierDeskModel: ObservableObject {
     @Published var transferProgress: Double?
     @Published var transferStatus: String?
     @Published var uploadQueue: [QueuedUpload] = []
+    @Published var savedTransfers: [DurableTransferSession] = []
     private var transferTask: Task<Void, Never>?
     private var retryTransfer: (() -> Void)?
     @AppStorage("restoreRecords") private var restoreData = Data()
@@ -79,9 +80,21 @@ final class GlacierDeskModel: ObservableObject {
             await upload(url)
         }
     }
-    func startFolderUpload(_ plan: FolderUploadPlan) {
-        guard transferTask == nil, !isBusy, identity != nil, connectedProfile == plan.profile,
-              selectedBucket?.name == plan.bucket, prefix == plan.prefix else {
+    private func transferStore() throws -> DurableTransferQueue {
+        guard let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw DurableTransferQueueError.database("Application Support directory is unavailable.")
+        }
+        return try DurableTransferQueue.shared(fileURL: root.appendingPathComponent("GlacierDesk/transfers.sqlite"))
+    }
+
+    func loadTransferHistory() async {
+        do { savedTransfers = try await transferStore().allSessions() }
+        catch { errorMessage = "Could not load transfer history: \(error.localizedDescription)" }
+    }
+
+    func startFolderUpload(_ plan: FolderUploadPlan, resuming: (DurableTransferSession, [DurableTransferItem])? = nil) {
+        guard transferTask == nil, !isBusy, let account = identity?.account, connectedProfile == plan.profile,
+              (resuming.map { $0.0.accountID == account } ?? (selectedBucket?.name == plan.bucket && prefix == plan.prefix)) else {
             errorMessage = "The selected account or destination changed. Prepare the upload again."
             return
         }
@@ -95,38 +108,113 @@ final class GlacierDeskModel: ObservableObject {
                 for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() }
                 isBusy = false; transferTask = nil
             }
-            var succeeded = 0, failed = 0
+            let queue: DurableTransferQueue
+            let session: DurableTransferSession
+            let durableItems: [DurableTransferItem]
+            do {
+                queue = try transferStore()
+                if let resumed = resuming {
+                    session = resumed.0; durableItems = resumed.1
+                } else {
+                    session = try await Task.detached(priority: .utility) {
+                        try DurableTransferSession.s3Upload(from: plan, accountID: account, storageClass: plan.storageClass)
+                    }.value
+                    try await queue.add(session)
+                    durableItems = session.items
+                }
+            } catch {
+                transferStatus = "Could not save transfer queue; no upload started: \(error.localizedDescription)"
+                await loadTransferHistory()
+                return
+            }
+            var succeeded = 0, failed = 0, persistenceFailed = false
             for index in plan.items.indices {
                 if Task.isCancelled { break }
                 let item = plan.items[index]
                 uploadQueue[index].state = "Preparing secure snapshot"
                 transferStatus = "Uploading \(index + 1) of \(plan.items.count): \(item.key)"
                 transferProgress = Double(index) / Double(plan.items.count)
+                var submitted = false
                 do {
                     let snapshot = try await item.snapshot()
                     defer { try? FileManager.default.removeItem(at: snapshot.deletingLastPathComponent()) }
+                    do {
+                        try await queue.updateItem(sessionID: session.id, itemID: durableItems[index].id, state: .inProgress,
+                                                   detail: "Upload started; completion may be uncertain after interruption.")
+                    } catch { persistenceFailed = true; throw error }
+                    submitted = true
                     uploadQueue[index].state = "Uploading"
                     try await uploadService.upload(fileURL: snapshot, bucket: plan.bucket, key: item.key,
                                                    storageClass: plan.storageClass, settings: plan.settings,
                                                    progress: { [weak self] fraction in
                         Task { @MainActor in self?.transferProgress = (Double(index) + fraction) / Double(plan.items.count) }
                     })
+                    do { try await queue.updateItem(sessionID: session.id, itemID: durableItems[index].id, state: .completed) }
+                    catch { persistenceFailed = true; throw error }
                     uploadQueue[index].state = "Complete"; succeeded += 1
                 } catch {
+                    let state: DurableTransferItem.State = submitted ? .interrupted : .failed
+                    do { try await queue.updateItem(sessionID: session.id, itemID: durableItems[index].id, state: state, detail: error.localizedDescription) }
+                    catch { transferStatus = "Queue persistence failed. Stop and inspect AWS before retrying: \(error.localizedDescription)"; failed += 1; break }
                     if Task.isCancelled { uploadQueue[index].state = "Cancelled"; break }
                     uploadQueue[index].state = "Failed: \(error.localizedDescription)"; failed += 1
+                    if persistenceFailed { break }
                 }
             }
             if Task.isCancelled {
                 for index in uploadQueue.indices where uploadQueue[index].state == "Queued" { uploadQueue[index].state = "Cancelled" }
                 transferProgress = nil
                 transferStatus = "Cancelled: \(succeeded) uploaded, \(failed) failed. Incomplete multipart parts may remain in S3."
+            } else if persistenceFailed {
+                transferProgress = nil
+                transferStatus = "Queue stopped because its state could not be saved. Inspect AWS before retrying."
             } else {
                 transferProgress = 1
                 transferStatus = "Upload queue finished: \(succeeded) uploaded, \(failed) failed."
             }
             activity.insert("Folder upload: \(succeeded) uploaded, \(failed) failed to \(plan.bucket)", at: 0)
+            await loadTransferHistory()
         }
+    }
+
+    func resumeS3Transfer(_ session: DurableTransferSession) async {
+        guard transferTask == nil, !isBusy, let profile = connectedProfile, let account = identity?.account,
+              session.kind == .s3Upload, let bucket = session.bucket, let prefix = session.prefix,
+              let storage = session.storageClass, let threshold = session.thresholdMiB,
+              let partSize = session.partSizeMiB, let connections = session.connections else {
+            errorMessage = "Connect the original profile and account before retrying this queue."
+            return
+        }
+        isBusy = true
+        var scopes: [(URL, Bool)] = []
+        var handedOff = false
+        defer {
+            for (url, active) in scopes where active { url.stopAccessingSecurityScopedResource() }
+            if !handedOff { isBusy = false }
+        }
+        do {
+            let current = try await AWSService(profile: profile).identity()
+            guard current.account == account else { throw DurableTransferQueueError.accountMismatch(expected: account, actual: current.account) }
+            let queue = try transferStore()
+            let records = try await queue.retryableItems(sessionID: session.id, selectedProfile: profile, currentAccountID: current.account, confirmInterruptedS3: true)
+            var seen = Set<String>()
+            for record in records {
+                guard let bookmark = record.rootBookmark else { throw DurableTransferQueueError.invalidSource("The saved folder bookmark is missing.") }
+                var stale = false
+                let root: URL
+                do { root = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale) }
+                catch { root = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) }
+                guard !stale else { throw DurableTransferQueueError.invalidSource("A saved folder bookmark is stale; prepare the queue again.") }
+                if seen.insert(root.path).inserted { scopes.append((root, root.startAccessingSecurityScopedResource())) }
+            }
+            let items = try await queue.reconstructFolderItems(records)
+            var settings = UploadSettings(); settings.thresholdMiB = threshold; settings.partSizeMiB = partSize; settings.connections = connections
+            let plan = FolderUploadPlan(bucket: bucket, prefix: prefix, profile: profile, storageClass: storage,
+                                        settings: settings, roots: scopes.map(\.0), items: items)
+            isBusy = false
+            startFolderUpload(plan, resuming: (session, records))
+            handedOff = transferTask != nil
+        } catch { errorMessage = "Could not retry saved queue: \(error.localizedDescription)" }
     }
     func startDownload(_ object: AWSObject, to destination: URL) {
         guard transferTask == nil else { return }
@@ -303,6 +391,8 @@ struct ContentView: View {
     @State private var showTransferSettings = false
     @State private var showLifecycle = false
     @State private var selectedKeys: Set<String> = []
+    @State private var pendingRecovery: DurableTransferSession?
+    @State private var showRecoveryConfirmation = false
     @State private var folderPlan: FolderUploadPlan?
     @State private var showFolderReview = false
     @State private var folderScopes: [URL] = []
@@ -321,7 +411,7 @@ struct ContentView: View {
                 case "Activity": activityView
                 case "Restores": restoresView
                 case "Vaults":
-                    if let profile = model.connectedProfile { LegacyVaultView(profile: profile, externalBusy: $model.isBusy) }
+                    if let profile = model.connectedProfile, let account = model.identity?.account { LegacyVaultView(profile: profile, accountID: account, externalBusy: $model.isBusy) }
                     else { EmptyState(title: "Connect to AWS", icon: "link", detail: "Connect a profile to find legacy Glacier vaults.") }
                 default: browser
                 }
@@ -347,6 +437,7 @@ struct ContentView: View {
         .tint(GlacierTheme.accent)
         .task {
             model.loadRestores()
+            await model.loadTransferHistory()
             await model.loadProfiles()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
@@ -387,6 +478,14 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { pendingRestore = nil }
         } message: {
             Text("AWS may charge for retrieval and for the temporary restored copy. The request lasts 3 days. Check current S3 pricing before proceeding.")
+        }
+        .confirmationDialog("Retry saved S3 queue?", isPresented: $showRecoveryConfirmation, titleVisibility: .visible) {
+            Button("Retry unfinished files") {
+                if let session = pendingRecovery { Task { await model.resumeS3Transfer(session) } }
+            }
+            Button("Cancel", role: .cancel) { pendingRecovery = nil }
+        } message: {
+            Text("Interrupted uploads may already have completed in AWS. Inspect the destination first. Retrying starts those files again and can overwrite objects and incur charges; completed files are not retried.")
         }
     }
 
@@ -442,23 +541,8 @@ struct ContentView: View {
                 Label("Legacy vaults", systemImage: "archivebox.fill").tag("Vaults")
             }.listStyle(.sidebar).frame(minHeight: 150, maxHeight: 190).disabled(model.isBusy)
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Button { bucketsExpanded.toggle() } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: bucketsExpanded ? "chevron.down" : "chevron.right")
-                            Text("BUCKETS")
-                            Spacer()
-                        }.font(.caption2.weight(.semibold)).foregroundStyle(.secondary).contentShape(Rectangle())
-                    }.buttonStyle(.plain)
-                        .accessibilityLabel("Buckets")
-                        .accessibilityValue(bucketsExpanded ? "Expanded" : "Collapsed")
-                        .help(bucketsExpanded ? "Collapse buckets" : "Expand buckets")
-                    if model.isBusy { ProgressView().controlSize(.small) }
-                }
-                if !bucketsExpanded {
-                    EmptyView()
-                } else if model.identity == nil {
+            DisclosureGroup(isExpanded: $bucketsExpanded) {
+                if model.identity == nil {
                     Text("Connect to load buckets.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
                 } else if model.buckets.isEmpty {
                     Text("No buckets available.").font(.caption).foregroundStyle(.secondary).padding(.vertical, 6)
@@ -479,6 +563,12 @@ struct ContentView: View {
                         }
                     }.frame(minHeight: 80, maxHeight: 300)
                 }
+            } label: {
+                HStack {
+                    Text("BUCKETS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    if model.isBusy { ProgressView().controlSize(.small) }
+                }.contentShape(Rectangle())
             }.padding(.horizontal, 14)
             Spacer(minLength: 4)
             Text("AWS CLI profile selection is explicit. Choose a vault to manage its archives.")
@@ -687,6 +777,26 @@ struct ContentView: View {
                         }
                     }.padding(16)
                 }.frame(maxHeight: 300)
+                Divider()
+            }
+            let savedS3 = model.savedTransfers.filter { $0.kind == .s3Upload }
+            if !savedS3.isEmpty {
+                Text("Saved upload queues").font(.headline).padding(.horizontal, 20).padding(.top, 12)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(savedS3) { session in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(session.destination).font(.callout).textSelection(.enabled)
+                                Text("Account \(session.accountID) · \(session.profile) · \(session.items.filter { $0.state == .completed }.count)/\(session.items.count) complete")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                if session.items.contains(where: { [.queued, .failed, .interrupted].contains($0.state) }) {
+                                    Button("Review and retry unfinished…") { pendingRecovery = session; showRecoveryConfirmation = true }
+                                        .disabled(model.isBusy || model.connectedProfile != session.profile || model.identity?.account != session.accountID)
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }.padding(16)
+                }.frame(maxHeight: 220)
                 Divider()
             }
             if model.activity.isEmpty {
