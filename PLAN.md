@@ -19,6 +19,8 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 ## Queue follow-up
 
+- [ ] Make **Stop** a graceful queue stop: do not start any additional files, allow each active file to finish uploading its remaining parts and complete normally, then leave never-started files pending for explicit resume. Keep a separate clearly labeled immediate cancellation action if interrupting active transfers is needed. Test concurrent uploads, stop/resume, errors, and queue persistence across restart.
+
 - [ ] Allow an operator to review and clear selected legacy upload records marked `outcomeUnknown` from the local transfer queue. Show the archive path and known multipart upload ID, explain that clearing the local record does not abort or delete anything in AWS, and require an explicit acknowledgement before removing the record. Preserve the existing restriction against automatic retry of uncertain uploads; offer guidance for inspecting and cleaning up an incomplete multipart upload in the correct account, Region, and vault. Include individual and bulk selection tests and verify that other queue entries are unaffected.
 
 ## Next milestones
