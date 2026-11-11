@@ -4,7 +4,25 @@ Notable user-visible changes are recorded here. Add new work under **Unreleased*
 
 ## Unreleased
 
-No changes recorded yet.
+- Add a Resume control for reviewed pending or failed legacy uploads, with account and source checks.
+
+- Allow 1–16 concurrent legacy file uploads, each with its own configured multipart request limit.
+
+- Show the active legacy upload method, completed multipart parts, part size, and parallel request limit.
+
+- Show selection checkboxes beside current legacy transfers in a movable, resizable queue window.
+- Add completed local legacy uploads to the browsable inventory after a queue finishes, marking them until an AWS inventory includes them.
+
+- Add separate stop, cancel pending, and clear finished controls for individual or bulk legacy queue items.
+
+- Fix AWS CLI handling of opaque multipart upload IDs and other tokens that start with a dash, including multipart cleanup.
+
+- Show transfer queues with live status, cancellation, and reviewed retries for S3 and legacy uploads.
+
+- Choose files and nested folders for upload to the current S3 or legacy vault folder; clarify local inventory retention.
+
+- Keep bucket root and parent-folder navigation available in the S3 browser, including inside empty folders.
+- Reconstruct a folder and file browser for legacy vault inventories, including encoded archive paths, with archive details available on demand.
 
 ## 0.2.0 — 2026-11-10
 

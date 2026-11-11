@@ -1,6 +1,13 @@
 import Foundation
 import CryptoKit
 
+public enum LegacyUploadStatus: Sendable {
+    case preparing(multipart: Bool)
+    case singleRequest
+    case multipart(completed: Int, total: Int, partSize: Int64, connections: Int)
+    case completing
+}
+
 /// Small AWS CLI adapter for the first GlacierDesk browsing and transfer flows.
 /// Every AWS command is pinned to an explicitly selected shared AWS profile.
 public struct AWSService: Sendable {
@@ -55,7 +62,7 @@ public struct AWSService: Sendable {
         var vaults: [LegacyVault] = []
         repeat {
             var args = ["glacier", "list-vaults", "--account-id", "-", "--region", region, "--limit", "1000", "--no-paginate"]
-            if let marker { args += ["--marker", marker] }
+            if let marker { args += ["--marker=\(marker)"] }
             let page = try Self.decoder().decode(LegacyVaultPage.self, from: await json(args))
             vaults.append(contentsOf: page.vaults ?? [])
             marker = page.marker?.isEmpty == false ? page.marker : nil
@@ -80,7 +87,7 @@ public struct AWSService: Sendable {
     public func legacyJobOutput(vault: String, region: String, job: LegacyJob, destination: URL) async throws {
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".glacierdesk-\(UUID().uuidString).download")
         defer { try? FileManager.default.removeItem(at: temporary) }
-        _ = try await run(["glacier", "get-job-output", "--account-id", "-", "--vault-name", vault, "--region", region, "--job-id", job.jobId, temporary.path])
+        _ = try await run(["glacier", "get-job-output", "--account-id", "-", "--vault-name", vault, "--region", region, "--job-id=\(job.jobId)", temporary.path])
         try Task.checkCancellation()
         let expectedSize = job.action == "ArchiveRetrieval" ? job.archiveSizeInBytes : job.inventorySizeInBytes
         if let expectedSize, let actual = try FileManager.default.attributesOfItem(atPath: temporary.path)[.size] as? NSNumber, actual.int64Value != expectedSize {
@@ -97,36 +104,42 @@ public struct AWSService: Sendable {
     }
 
     public func uploadLegacyArchive(vault: String, region: String, file: URL, description requestedDescription: String? = nil,
-                                    settings: UploadSettings = .init(), progress: (@Sendable (Double) -> Void)? = nil) async throws -> String {
+                                    settings: UploadSettings = .init(), progress: (@Sendable (Double) -> Void)? = nil,
+                                    status: (@Sendable (LegacyUploadStatus) -> Void)? = nil) async throws -> String {
         try settings.validate()
         let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
         guard let size = attributes[.size] as? NSNumber, size.int64Value > 0 else {
             throw AWSServiceError.commandFailed("Legacy Glacier archives must contain at least one byte.")
         }
         let total = size.int64Value
+        let multipart = total >= Int64(settings.thresholdMiB) * 1_048_576 || total > 4 * 1_073_741_824
+        status?(.preparing(multipart: multipart))
         let checksum = try glacierTreeHash(file)
         let description = String((requestedDescription ?? file.lastPathComponent).unicodeScalars.map { (32...126).contains($0.value) ? Character($0) : "_" }.prefix(1024))
-        if total >= Int64(settings.thresholdMiB) * 1_048_576 || total > 4 * 1_073_741_824 {
-            return try await uploadLegacyMultipart(vault: vault, region: region, file: file, total: total, checksum: checksum, description: description, settings: settings, progress: progress)
+        if multipart {
+            return try await uploadLegacyMultipart(vault: vault, region: region, file: file, total: total, checksum: checksum, description: description, settings: settings, progress: progress, status: status)
         }
-        let data = try await json(["glacier", "upload-archive", "--account-id", "-", "--vault-name", vault, "--region", region, "--archive-description", description, "--checksum", checksum, "--body", file.path])
+        status?(.singleRequest)
+        let data = try await json(["glacier", "upload-archive", "--account-id", "-", "--vault-name", vault, "--region", region, "--archive-description=\(description)", "--checksum", checksum, "--body", file.path])
         return try Self.decoder().decode(LegacyUploadResult.self, from: data).archiveId
     }
 
     private func uploadLegacyMultipart(vault: String, region: String, file: URL, total: Int64, checksum: String, description: String,
-                                       settings: UploadSettings, progress: (@Sendable (Double) -> Void)?) async throws -> String {
+                                       settings: UploadSettings, progress: (@Sendable (Double) -> Void)?,
+                                       status: (@Sendable (LegacyUploadStatus) -> Void)?) async throws -> String {
         let mib: Int64 = 1_048_576
         let required = max(Int64(settings.partSizeMiB) * mib, (total + 9_999) / 10_000)
         var partSize = mib
         while partSize < required && partSize < 4096 * mib { partSize *= 2 }
         guard partSize >= required else { throw AWSServiceError.commandFailed("Archive or part size exceeds Glacier multipart limits (maximum 4 GiB per part and 10,000 parts).") }
         let partCount = Int((total + partSize - 1) / partSize)
+        status?(.multipart(completed: 0, total: partCount, partSize: partSize, connections: min(settings.connections, partCount)))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
         let uploadId: String
         do {
-            let initial = try await json(["glacier", "initiate-multipart-upload", "--account-id", "-", "--vault-name", vault, "--region", region, "--archive-description", description, "--part-size", "\(partSize)"])
+            let initial = try await json(["glacier", "initiate-multipart-upload", "--account-id", "-", "--vault-name", vault, "--region", region, "--archive-description=\(description)", "--part-size", "\(partSize)"])
             uploadId = try Self.decoder().decode(LegacyMultipartInitiated.self, from: initial).uploadId
         } catch {
             throw AWSServiceError.commandFailed("Could not confirm multipart initiation. An incomplete upload may exist without a known ID; inspect Glacier multipart uploads before retrying. \(error.localizedDescription)")
@@ -141,24 +154,26 @@ public struct AWSService: Sendable {
                         defer { try? FileManager.default.removeItem(at: part) }
                         try writeLegacyPart(source: file, destination: part, offset: offset, length: length)
                         let partHash = try glacierTreeHash(part)
-                        _ = try await run(["glacier", "upload-multipart-part", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id", uploadId, "--range", "bytes \(offset)-\(offset + length - 1)/*", "--checksum", partHash, "--body", part.path])
+                        _ = try await run(["glacier", "upload-multipart-part", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id=\(uploadId)", "--range", "bytes \(offset)-\(offset + length - 1)/*", "--checksum", partHash, "--body", part.path])
                     }
                 }
                 while next < min(partCount, settings.connections) { addPart(next); next += 1 }
                 while try await group.next() != nil {
                     completed += 1; progress?(Double(completed) / Double(partCount))
+                    status?(.multipart(completed: completed, total: partCount, partSize: partSize, connections: min(settings.connections, partCount)))
                     if next < partCount { addPart(next); next += 1 }
                 }
             }
         } catch {
             let aborted = await Task.detached {
-                do { _ = try await run(["glacier", "abort-multipart-upload", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id", uploadId]); return true }
+                do { _ = try await run(["glacier", "abort-multipart-upload", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id=\(uploadId)"]); return true }
                 catch { return false }
             }.value
             throw AWSServiceError.commandFailed("Legacy multipart upload \(uploadId) failed or was cancelled. " + (aborted ? "AWS confirmed the incomplete upload was aborted." : "Abort was not confirmed; inspect and clean up this multipart upload in Glacier.") + " \(error.localizedDescription)")
         }
         do {
-            let result = try await json(["glacier", "complete-multipart-upload", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id", uploadId, "--archive-size", "\(total)", "--checksum", checksum])
+            status?(.completing)
+            let result = try await json(["glacier", "complete-multipart-upload", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id=\(uploadId)", "--archive-size", "\(total)", "--checksum", checksum])
             return try Self.decoder().decode(LegacyUploadResult.self, from: result).archiveId
         } catch {
             throw AWSServiceError.commandFailed("Completion outcome is unknown for legacy multipart upload \(uploadId). Check Glacier before retrying; an archive may have been created. \(error.localizedDescription)")
@@ -171,8 +186,8 @@ public struct AWSService: Sendable {
         var args = ["s3api", "list-objects-v2", "--bucket", bucket,
                     "--max-keys", String(max(1, min(maxKeys, 1000))), "--no-paginate"]
         if !recursive { args += ["--delimiter", "/"] }
-        if let prefix { args += ["--prefix", prefix] }
-        if let continuationToken { args += ["--continuation-token", continuationToken] }
+        if let prefix { args += ["--prefix=\(prefix)"] }
+        if let continuationToken { args += ["--continuation-token=\(continuationToken)"] }
         let data = try await json(args)
         return try Self.decoder().decode(AWSObjectPage.self, from: data)
     }
@@ -193,7 +208,7 @@ public struct AWSService: Sendable {
     }
 
     public func headObject(bucket: String, key: String) async throws -> AWSObjectMetadata {
-        let data = try await json(["s3api", "head-object", "--bucket", bucket, "--key", key])
+        let data = try await json(["s3api", "head-object", "--bucket", bucket, "--key=\(key)"])
         return try Self.decoder().decode(AWSObjectMetadata.self, from: data)
     }
 
@@ -267,7 +282,7 @@ public struct AWSService: Sendable {
         guard let bodyString = String(data: body, encoding: .utf8) else {
             throw AWSServiceError.invalidResponse
         }
-        _ = try await run(["s3api", "restore-object", "--bucket", bucket, "--key", key,
+        _ = try await run(["s3api", "restore-object", "--bucket", bucket, "--key=\(key)",
                            "--restore-request", bodyString])
     }
 

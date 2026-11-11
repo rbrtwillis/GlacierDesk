@@ -44,6 +44,7 @@ final class GlacierDeskModel: ObservableObject {
     @AppStorage("uploadThresholdMiB") var uploadThresholdMiB = 64
     @AppStorage("uploadPartSizeMiB") var uploadPartSizeMiB = 16
     @AppStorage("uploadConnections") var uploadConnections = 4
+    @AppStorage("legacyParallelFiles") var legacyParallelFiles = 1
 
     private var service: AWSService? {
         let profile = connectedProfile ?? selectedProfile
@@ -71,6 +72,7 @@ final class GlacierDeskModel: ObservableObject {
     func cancelTransfer() { transferTask?.cancel(); transferStatus = "Cancelling…" }
     func retryLastTransfer() { retryTransfer?() }
     var canRetryTransfer: Bool { transferTask == nil && retryTransfer != nil }
+    var transferActive: Bool { transferTask != nil }
     func startUpload(_ url: URL) {
         guard transferTask == nil else { return }
         retryTransfer = { [weak self] in self?.startUpload(url) }
@@ -395,6 +397,9 @@ struct ContentView: View {
     @State private var showRecoveryConfirmation = false
     @State private var folderPlan: FolderUploadPlan?
     @State private var showFolderReview = false
+    @State private var showTransferQueue = false
+    @State private var openQueueAfterReview = false
+    @State private var queueRetryConfirmation = false
     @State private var folderScopes: [URL] = []
     @State private var preparingDrop = false
     @State private var dropTargeted = false
@@ -431,9 +436,13 @@ struct ContentView: View {
                 LifecycleView(service: AWSService(profile: profile), bucket: bucket.name, account: account)
             }
         }
-        .sheet(isPresented: $showFolderReview, onDismiss: releaseFolderScopes) {
+        .sheet(isPresented: $showFolderReview, onDismiss: {
+            releaseFolderScopes()
+            if openQueueAfterReview { openQueueAfterReview = false; showTransferQueue = true }
+        }) {
             if let plan = folderPlan { folderReview(plan) }
         }
+        .sheet(isPresented: $showTransferQueue) { transferQueueWindow }
         .tint(GlacierTheme.accent)
         .task {
             model.loadRestores()
@@ -581,6 +590,8 @@ struct ContentView: View {
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            Button { showTransferQueue = true; Task { await model.loadTransferHistory() } } label: { Image(systemName: "list.bullet.rectangle") }
+                .help("Transfer queue")
             Button { showTransferSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
                 .help("Upload settings")
                 .disabled(model.isBusy)
@@ -589,7 +600,9 @@ struct ContentView: View {
                         Text("Upload settings").font(.headline)
                         Stepper("Multipart threshold: \(model.uploadThresholdMiB) MiB", value: $model.uploadThresholdMiB, in: 1...5120)
                         Stepper("Part size: \(model.uploadPartSizeMiB) MiB", value: $model.uploadPartSizeMiB, in: 5...5120)
-                        Stepper("Parallel requests: \(model.uploadConnections)", value: $model.uploadConnections, in: 1...32)
+                        Stepper("Multipart requests per file: \(model.uploadConnections)", value: $model.uploadConnections, in: 1...32)
+                        Stepper("Legacy files at once: \(model.legacyParallelFiles)", value: $model.legacyParallelFiles, in: 1...16)
+                        Text("Up to the file limit × multipart requests may run at once. Each active file uses temporary disk space.").font(.caption).foregroundStyle(.secondary)
                         Text("Files above the threshold use multipart upload. AWS may increase the part size for very large files. Settings apply to new uploads.")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }.padding(18).frame(width: 340)
@@ -606,7 +619,7 @@ struct ContentView: View {
                     Text("Glacier Flexible").tag("GLACIER")
                     Text("Deep Archive").tag("DEEP_ARCHIVE")
                 }.frame(width: 175).help("Storage class for the next upload")
-                Button { showUpload = true } label: { Label("Upload", systemImage: "arrow.up.doc") }
+                Button { chooseBucketUpload() } label: { Label("Upload", systemImage: "arrow.up.doc") }
                     .disabled(model.identity == nil || model.selectedBucket == nil || model.isBusy)
             }
             Button { Task { await model.loadPage(reset: true) } } label: { Image(systemName: "arrow.clockwise") }
@@ -678,15 +691,20 @@ struct ContentView: View {
                 Text("STORAGE CLASS").frame(width: 150, alignment: .trailing)
             }.font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 9)
             Divider()
-            if model.objects.isEmpty && model.prefixes.isEmpty && !model.isBusy {
-                EmptyState(title: "This prefix is empty", icon: "folder", detail: "Upload an object or open another prefix.")
+            HStack {
+                Button("← Parent folder") { Task { await model.openPrefix(parentPrefix(model.prefix)) } }
+                    .disabled(model.prefix.isEmpty || model.isBusy)
+                Button("Bucket root") { Task { await model.openPrefix("") } }
+                    .disabled(model.prefix.isEmpty || model.isBusy)
+                Text(model.prefix.isEmpty ? "/" : "/" + model.prefix)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
+                Spacer()
+            }.padding(.horizontal, 16).padding(.vertical, 8)
+            Divider()
+            if model.objects.filter({ $0.key != model.prefix }).isEmpty && model.prefixes.isEmpty && !model.isBusy && !model.canLoadMore {
+                EmptyState(title: "This folder is empty", icon: "folder", detail: "Upload a file or navigate to another folder.")
             } else {
                 List(selection: $selectedKeys) {
-                    if !model.prefix.isEmpty {
-                        Button { Task { await model.openPrefix(parentPrefix(model.prefix)) } } label: {
-                            Label("..", systemImage: "arrow.up.folder").foregroundStyle(.secondary)
-                        }.buttonStyle(.plain)
-                    }
                     ForEach(model.prefixes) { folder in
                         Button { Task { await model.openPrefix(folder.prefix) } } label: {
                             HStack { Label(folderName(folder.prefix), systemImage: "folder.fill").foregroundStyle(GlacierTheme.accent); Spacer(); Text("Folder").font(.caption).foregroundStyle(.secondary) }
@@ -752,7 +770,11 @@ struct ContentView: View {
 
     private var activityView: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Activity").font(.title2.weight(.semibold)).padding(20)
+            HStack {
+                Text("Activity").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Transfer queue…") { showTransferQueue = true; Task { await model.loadTransferHistory() } }
+            }.padding(20)
             Divider()
             if let status = model.transferStatus {
                 VStack(alignment: .leading, spacing: 8) {
@@ -807,6 +829,52 @@ struct ContentView: View {
         }
     }
 
+    private var transferQueueWindow: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Transfer queue").font(.title2.weight(.semibold))
+            if let status = model.transferStatus { Text(status).textSelection(.enabled) }
+            if let progress = model.transferProgress { ProgressView(value: progress) }
+            HStack {
+                if model.transferActive { Button("Cancel transfer") { model.cancelTransfer() } }
+                if model.canRetryTransfer { Button("Retry transfer") { model.retryLastTransfer() } }
+                Spacer()
+                Button("Refresh history") { Task { await model.loadTransferHistory() } }
+            }
+            List {
+                if !model.uploadQueue.isEmpty {
+                    Section("Current queue") {
+                        ForEach(model.uploadQueue) { entry in
+                            VStack(alignment: .leading) {
+                                Text(entry.item.key).textSelection(.enabled)
+                                Text(entry.state).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+                ForEach(model.savedTransfers.filter { $0.kind == .s3Upload }) { session in
+                    Section("\(session.destination) · \(session.createdAt.formatted(date: .abbreviated, time: .shortened))") {
+                        if session.items.contains(where: { [.queued, .failed, .interrupted].contains($0.state) }) {
+                            Button("Review and retry unfinished…") { pendingRecovery = session; queueRetryConfirmation = true }
+                                .disabled(model.transferActive || model.isBusy || model.connectedProfile != session.profile || model.identity?.account != session.accountID)
+                        }
+                        ForEach(session.items) { item in
+                            VStack(alignment: .leading) {
+                                Text(item.target).font(.caption.monospaced()).textSelection(.enabled)
+                                Text(item.detail.map { "\(item.state.rawValue) · \($0)" } ?? item.state.rawValue).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+            HStack { Spacer(); Button("Close") { showTransferQueue = false } }
+        }.padding(18).frame(minWidth: 680, minHeight: 480)
+        .task { await model.loadTransferHistory() }
+        .confirmationDialog("Retry saved S3 queue?", isPresented: $queueRetryConfirmation, titleVisibility: .visible) {
+            Button("Retry unfinished files") { if let session = pendingRecovery { Task { await model.resumeS3Transfer(session) } } }
+            Button("Cancel", role: .cancel) { pendingRecovery = nil }
+        } message: { Text("Interrupted uploads may already have completed in AWS. Inspect the destination first. Retrying starts those files again and can overwrite objects and incur charges; completed files are not retried.") }
+    }
+
     private func folderReview(_ plan: FolderUploadPlan) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Review upload queue").font(.title2.weight(.semibold))
@@ -820,6 +888,7 @@ struct ContentView: View {
                 Button("Cancel") { showFolderReview = false }
                 Button("Upload \(plan.items.count) files") {
                     model.startFolderUpload(plan)
+                    openQueueAfterReview = true
                     showFolderReview = false
                     selectedSection = "Activity"
                 }.buttonStyle(.borderedProminent)
@@ -831,6 +900,29 @@ struct ContentView: View {
         for url in folderScopes { url.stopAccessingSecurityScopedResource() }
         folderScopes = []
         folderPlan = nil
+    }
+
+    @MainActor private func chooseBucketUpload() {
+        guard selectedSection == "Browse", model.identity != nil, let bucket = model.selectedBucket?.name,
+              let profile = model.connectedProfile, !model.isBusy, !preparingDrop else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK else { return }
+        let roots = panel.urls, prefix = model.prefix, storageClass = model.storageClass
+        for url in roots where url.startAccessingSecurityScopedResource() { folderScopes.append(url) }
+        var settings = UploadSettings(); settings.thresholdMiB = model.uploadThresholdMiB; settings.partSizeMiB = model.uploadPartSizeMiB; settings.connections = model.uploadConnections
+        preparingDrop = true
+        Task { @MainActor in
+            defer { preparingDrop = false }
+            do {
+                let plan = try await Task.detached(priority: .userInitiated) {
+                    try FolderUploadPlan.build(roots: roots, bucket: bucket, prefix: prefix, profile: profile, storageClass: storageClass, settings: settings)
+                }.value
+                guard model.connectedProfile == profile, model.selectedBucket?.name == bucket, model.prefix == prefix, !model.isBusy else { throw FolderUploadError.message("The destination changed while preparing the queue. Choose the files again.") }
+                folderPlan = plan; showFolderReview = true
+            } catch { releaseFolderScopes(); model.errorMessage = error.localizedDescription }
+        }
     }
 
     private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -921,6 +1013,7 @@ struct ContentView: View {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.startDownload(object, to: url)
+        showTransferQueue = true
     }
     private func chooseBatchDirectory() {
         let objects = model.objects.filter { selectedKeys.contains($0.key) }
@@ -930,6 +1023,7 @@ struct ContentView: View {
         panel.prompt = "Download here"
         guard panel.runModal() == .OK, let folder = panel.url else { return }
         model.startBatchDownload(objects, to: folder)
+        showTransferQueue = true
         selectedSection = "Activity"
     }
     private func availableRestoreTiers(for object: AWSObject?) -> [RestoreTier] {

@@ -30,6 +30,10 @@ struct LegacyVaultDetailView: View {
     @State private var notifiedJobStates: [String: String] = [:]
     @State private var jobRefreshError: String?
     @State private var inventoryDate: String?
+    @State private var inventoryFolders: LegacyInventoryFolders?
+    @State private var locallyAddedArchiveIDs = Set<String>()
+    @State private var currentInventoryFolder = ""
+    @State private var visibleInventoryFolders: [String] = []
     @State private var inventoryPage: GlacierArchivePage?
     @State private var inventoryIndexError: String?
     @State private var inventoryOffset = 0
@@ -53,6 +57,7 @@ struct LegacyVaultDetailView: View {
     @AppStorage("uploadThresholdMiB") private var uploadThresholdMiB = 64
     @AppStorage("uploadPartSizeMiB") private var uploadPartSizeMiB = 16
     @AppStorage("uploadConnections") private var uploadConnections = 4
+    @AppStorage("legacyParallelFiles") private var legacyParallelFiles = 1
     @State private var folderPlan: FolderUploadPlan?
     @State private var folderScopes: [URL] = []
     @State private var showFolderReview = false
@@ -61,10 +66,16 @@ struct LegacyVaultDetailView: View {
     @State private var uploadQueue: [QueuedUpload] = []
     @State private var queueTask: Task<Void, Never>?
     @State private var queueProgress: Double = 0
+    @State private var activeUploadDetail: String?
+    @State private var activeUploadToken: UUID?
     @State private var preparingFolderUpload = false
     @State private var durableQueue: DurableTransferQueue?
     @State private var durableTransferHistory: [DurableTransferSession] = []
     @State private var showTransferHistory = false
+    @State private var clearingPendingQueue = false
+    @State private var selectedQueueItems = Set<UUID>()
+    @State private var currentQueueIDs: [UUID: UUID] = [:]
+    @State private var openQueueAfterReview = false
     @State private var reviewedLegacyRetrySession: DurableTransferSession?
     @State private var reviewedLegacyRetryItems: [DurableTransferItem] = []
     @State private var confirmLegacyRetry = false
@@ -109,7 +120,7 @@ struct LegacyVaultDetailView: View {
                 HStack {
                     Button("Request inventory…") { confirmInventory = true }.disabled(busy)
                     Button("Refresh jobs") { Task { await refresh() } }.disabled(busy)
-                    Button("Upload archive…") { showingFilePicker = true }.disabled(busy)
+                    Button("Upload files or folders…") { chooseLegacyUpload() }.disabled(busy)
                     if busy { ProgressView().controlSize(.small) }
                 }
                 Text(dropTargeted ? "Drop to prepare upload" : "Drag files or folders from Finder here to prepare an upload queue.")
@@ -124,7 +135,7 @@ struct LegacyVaultDetailView: View {
                         }
                     }
                 }
-                Button("Transfer history") { showTransferHistory = true; Task { await refreshTransferHistory() } }
+                Button("Transfer queue…") { showTransferHistory = true; Task { await refreshTransferHistory() } }
                 if let status { Text(status).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 Divider()
                 Text("Jobs").font(.headline)
@@ -137,7 +148,7 @@ struct LegacyVaultDetailView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("\(job.action ?? "Job") · \(job.statusCode ?? "Unknown")").font(.subheadline.weight(.semibold))
                         if job.statusCode == "Succeeded" && (job.action == "ArchiveRetrieval" || job.action == "InventoryRetrieval") {
-                            Label("AWS retains job output for at least 24 hours after completion", systemImage: "clock")
+                            Label("AWS keeps job output for at least 24 hours; opened inventories remain cached on this Mac", systemImage: "clock")
                                 .font(.caption).foregroundStyle(.orange)
                         } else if job.statusCode == "InProgress" {
                             Label("AWS is processing this job; jobs refresh automatically while in progress", systemImage: "arrow.triangle.2.circlepath")
@@ -181,7 +192,7 @@ struct LegacyVaultDetailView: View {
                     Divider()
                 }
                 Text("Browse inventory").font(.headline)
-                if let inventoryDate { Text("Inventory date: \(inventoryDate) · \(inventoryPage?.totalCount ?? 0) archives").font(.caption).foregroundStyle(.secondary) }
+                if let inventoryDate { Text("Cached inventory date: \(inventoryDate) · Saved on this Mac until replaced or removed").font(.caption).foregroundStyle(.secondary) }
                 if inventoryDate != nil {
                     Button("Compare inventory with S3…") { showMigration = true; migrationAssessment = nil }
                         .disabled(busy || inventoryPage == nil || inventoryIndexError != nil)
@@ -190,9 +201,19 @@ struct LegacyVaultDetailView: View {
                     Text("Read-only comparison. Candidate matches are based on archive description and reported size; they do not verify object contents.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Open a completed inventory job above. Search results are shown in pages of \(inventoryPageSize).")
+                if !locallyAddedArchiveIDs.isEmpty { Text("Includes \(locallyAddedArchiveIDs.count) locally recorded uploads not yet present in the AWS inventory snapshot.").font(.caption).foregroundStyle(.secondary) }
+                Text("Folders are reconstructed from archive descriptions. Search applies to the current folder; files without a usable path appear at the root.")
                     .font(.caption).foregroundStyle(.secondary)
-                TextField("Search archives", text: $search).textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("← Parent folder") {
+                        currentInventoryFolder = currentInventoryFolder.split(separator: "/").dropLast().joined(separator: "/")
+                        inventoryOffset = 0; Task { await loadInventoryPage() }
+                    }.disabled(currentInventoryFolder.isEmpty)
+                    Button("Vault root") { currentInventoryFolder = ""; inventoryOffset = 0; Task { await loadInventoryPage() } }
+                        .disabled(currentInventoryFolder.isEmpty)
+                    Text(currentInventoryFolder.isEmpty ? "/" : "/" + currentInventoryFolder).textSelection(.enabled)
+                }
+                TextField("Search current folder", text: $search).textFieldStyle(.roundedBorder)
                     .onChange(of: search) { _ in inventoryOffset = 0; Task { await loadInventoryPage() } }
                 HStack {
                     Picker("Sort", selection: $inventorySortChoice) {
@@ -204,10 +225,21 @@ struct LegacyVaultDetailView: View {
                 .onChange(of: inventorySortChoice) { _ in inventoryOffset = 0; Task { await loadInventoryPage() } }
                 .onChange(of: inventoryAscending) { _ in inventoryOffset = 0; Task { await loadInventoryPage() } }
                 if let inventoryIndexError { Text("Local inventory index is unavailable. Reload a completed inventory before browsing or comparing: \(inventoryIndexError)").font(.caption).foregroundStyle(.orange) }
+                ForEach(visibleInventoryFolders, id: \.self) { folder in
+                    Button {
+                        currentInventoryFolder = currentInventoryFolder.isEmpty ? folder : currentInventoryFolder + "/" + folder
+                        search = ""; inventoryOffset = 0; Task { await loadInventoryPage() }
+                    } label: { Label(folder, systemImage: "folder.fill").frame(maxWidth: .infinity, alignment: .leading) }
+                        .buttonStyle(.plain).padding(.vertical, 5)
+                }
                 ForEach(visibleArchives) { archive in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(archive.description?.isEmpty == false ? archive.description! : "Unnamed archive").font(.subheadline.weight(.medium)).textSelection(.enabled)
-                        Text(archive.archiveID).font(.caption.monospaced()).textSelection(.enabled)
+                        Label(LegacyInventoryFolders.filename(archive), systemImage: "doc").font(.subheadline.weight(.medium)).textSelection(.enabled)
+                        if locallyAddedArchiveIDs.contains(archive.archiveID) { Text("Uploaded from this Mac · not yet in AWS inventory snapshot").font(.caption).foregroundStyle(.secondary) }
+                        DisclosureGroup("Archive details") {
+                            Text("Archive ID: \(archive.archiveID)").font(.caption.monospaced()).textSelection(.enabled)
+                            if let description = archive.description { Text("Description: \(description)").font(.caption).textSelection(.enabled) }
+                        }
                         Text("\(archive.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "Unknown size") · \(archive.creationDate ?? "Unknown date")").font(.caption).foregroundStyle(.secondary)
                         Button("Select for retrieval") { archiveID = archive.archiveID }.disabled(busy)
                     }.padding(.vertical, 5)
@@ -234,7 +266,10 @@ struct LegacyVaultDetailView: View {
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: acceptDrop)
         .onChange(of: busy) { externalBusy = $0 }
         .onDisappear { externalBusy = false }
-        .sheet(isPresented: $showFolderReview, onDismiss: releaseFolderScopes) {
+        .sheet(isPresented: $showFolderReview, onDismiss: {
+            releaseFolderScopes()
+            if openQueueAfterReview { openQueueAfterReview = false; showTransferHistory = true }
+        }) {
             if let plan = folderPlan { folderReview(plan) }
         }
         .sheet(isPresented: $showMigration) {
@@ -271,12 +306,45 @@ struct LegacyVaultDetailView: View {
                 archives: visibleArchives.map { BulkRetrievalArchive(id: $0.archiveID, description: $0.description, size: $0.size) })
                 .frame(minWidth: 680, minHeight: 560)
         }
-        .sheet(isPresented: $showTransferHistory) {
+        .background(FloatingQueueWindow(isPresented: $showTransferHistory, content:
             VStack(alignment: .leading, spacing: 12) {
-                Text("Legacy folder upload history").font(.title2.weight(.semibold))
-                Text("A result marked outcome unknown may have created an archive in AWS. Inspect the vault before taking any further action. Legacy archive uploads cannot be resumed or safely retried automatically.")
+                Text("Legacy transfer queue").font(.title2.weight(.semibold))
+                if let status { Text(status).textSelection(.enabled) }
+                if queueTask != nil {
+                    ProgressView("Overall queue", value: queueProgress)
+                    if let activeUploadDetail { Text(activeUploadDetail).font(.callout).textSelection(.enabled) }
+                }
+                HStack {
+                    Button("Stop all active transfers") { queueTask?.cancel() }.disabled(queueTask == nil)
+                    Button("Resume…") { Task { await prepareResume() } }
+                        .disabled(busy || queueTask != nil || clearingPendingQueue || !hasResumableItems)
+                    Button(selectedQueueItems.isEmpty ? "Cancel all pending" : "Cancel selected pending") { Task { await editQueue(clear: false) } }
+                        .disabled(clearingPendingQueue)
+                    Button(selectedQueueItems.isEmpty ? "Clear finished" : "Clear selected finished") { Task { await editQueue(clear: true) } }
+                        .disabled(clearingPendingQueue || queueTask != nil)
+                    Spacer()
+                }
+                Text("Select items below to act on individual files; with nothing selected, actions apply to all eligible files. Clear removes completed, failed, and cancelled items; uncertain results remain for inspection.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("A result marked outcome unknown may have created an archive in AWS. Inspect the vault before taking any further action. Resume starts eligible files again after review; multipart parts do not resume. Uncertain uploads cannot be retried safely without inspection.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 List {
+                    if !uploadQueue.isEmpty {
+                        Section("Current queue") {
+                            ForEach(uploadQueue) { item in
+                                HStack(alignment: .top) {
+                                    if let recordID = currentQueueIDs[item.id] {
+                                        Toggle("Select \(item.item.key)", isOn: Binding(get: { selectedQueueItems.contains(recordID) }, set: { selected in if selected { selectedQueueItems.insert(recordID) } else { selectedQueueItems.remove(recordID) } }))
+                                            .labelsHidden().toggleStyle(.checkbox)
+                                    }
+                                    VStack(alignment: .leading) {
+                                        Text(item.item.key).font(.caption.monospaced()).textSelection(.enabled)
+                                        Text(item.state).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ForEach(durableTransferHistory) { session in
                         Section("\(session.createdAt.formatted(date: .abbreviated, time: .shortened)) · \(session.region ?? "Region unknown") · \(session.vault ?? "Vault unknown")") {
                             if session.kind == .legacyArchiveUpload && session.profile == profile && session.accountID == accountID {
@@ -284,10 +352,14 @@ struct LegacyVaultDetailView: View {
                                     .disabled(busy || queueTask != nil)
                             }
                             ForEach(session.items) { item in
-                                VStack(alignment: .leading, spacing: 3) {
+                                HStack(alignment: .top) {
+                                    Toggle("Select \(item.target)", isOn: Binding(get: { selectedQueueItems.contains(item.id) }, set: { selected in if selected { selectedQueueItems.insert(item.id) } else { selectedQueueItems.remove(item.id) } }))
+                                        .labelsHidden().toggleStyle(.checkbox)
+                                    VStack(alignment: .leading, spacing: 3) {
                                     Text(item.target).font(.caption.monospaced()).textSelection(.enabled)
                                     Text(item.detail.map { "\(item.state.rawValue) · \($0)" } ?? item.state.rawValue)
                                         .font(.caption).foregroundStyle(item.state == .outcomeUnknown ? .orange : .secondary).textSelection(.enabled)
+                                    }
                                 }.padding(.vertical, 3)
                             }
                         }
@@ -299,7 +371,14 @@ struct LegacyVaultDetailView: View {
                     Button("Done") { showTransferHistory = false }
                 }
             }.padding(18).frame(minWidth: 620, minHeight: 440)
-        }
+            .confirmationDialog("Retry selected legacy folder uploads?", isPresented: $confirmLegacyRetry, titleVisibility: .visible) {
+                Button("I reviewed the risks — retry \(reviewedLegacyRetryItems.count) items") {
+                    guard let session = reviewedLegacyRetrySession else { return }
+                    Task { await retryLegacyFolderItems(session) }
+                }
+                Button("Cancel", role: .cancel) { clearLegacyRetryReview() }
+            } message: { Text(legacyRetryReviewText) }
+        ))
         .task {
             await refresh()
             await restoreCachedInventory()
@@ -328,13 +407,6 @@ struct LegacyVaultDetailView: View {
             Button("Upload") { if let file = uploadFile { Task { await upload(file) } } }
             Button("Cancel", role: .cancel) { uploadFile = nil }
         } message: { Text("Storage and request charges apply. Multipart uploads use the configured transfer settings. Save the returned archive ID.") }
-        .confirmationDialog("Retry selected legacy folder uploads?", isPresented: $confirmLegacyRetry, titleVisibility: .visible) {
-            Button("I reviewed the risks — retry \(reviewedLegacyRetryItems.count) items") {
-                guard let session = reviewedLegacyRetrySession else { return }
-                Task { await retryLegacyFolderItems(session) }
-            }
-            Button("Cancel", role: .cancel) { clearLegacyRetryReview() }
-        } message: { Text(legacyRetryReviewText) }
     }
 
     @MainActor private func refresh(automatic: Bool = false) async {
@@ -441,6 +513,7 @@ struct LegacyVaultDetailView: View {
             let scope = inventoryScope
             let date = try await Task.detached(priority: .utility) { try index.importInventoryJSON(at: file, scope: scope) }.value
             inventoryDate = date ?? "Unknown"
+            inventoryFolders = nil; currentInventoryFolder = ""; visibleInventoryFolders = []
             inventoryIndexError = nil
             inventoryOffset = 0
             await loadInventoryPage()
@@ -465,11 +538,24 @@ struct LegacyVaultDetailView: View {
         let scope = inventoryScope, query = search, offset = inventoryOffset, size = inventoryPageSize
         let sort = selectedInventorySort, ascending = inventoryAscending
         do {
-            let page = try await Task.detached(priority: .utility) {
-                try index.search(scope: scope, search: query, offset: offset, pageSize: size, sort: sort, ascending: ascending)
+            let existing = inventoryFolders, folder = currentInventoryFolder, existingLocal = locallyAddedArchiveIDs
+            let locallySaved = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }.map { IndexedGlacierArchive(archiveID: $0.id, description: String($0.filename.unicodeScalars.map { (32...126).contains($0.value) ? Character($0) : "_" }.prefix(1024))) }
+            let result = try await Task.detached(priority: .utility) {
+                var tree = existing ?? LegacyInventoryFolders()
+                var localIDs = existingLocal
+                if existing == nil {
+                    var savedByID = Dictionary(locallySaved.map { ($0.archiveID, $0) }, uniquingKeysWith: { first, _ in first })
+                    try index.forEachArchive(scope: scope) { archive in tree.add(archive); savedByID.removeValue(forKey: archive.archiveID) }
+                    localIDs = Set(savedByID.keys)
+                    for archive in savedByID.values { tree.add(archive) }
+                }
+                return (tree, tree.listing(folder: folder, search: query, offset: offset, pageSize: size, sort: sort, ascending: ascending), localIDs)
             }.value
             guard inventoryQueryToken == token else { return }
-            inventoryPage = page
+            inventoryFolders = result.0
+            locallyAddedArchiveIDs = result.2
+            visibleInventoryFolders = result.1.folders
+            inventoryPage = result.1.page
             inventoryIndexError = nil
         } catch { guard inventoryQueryToken == token else { return }; inventoryIndexError = error.localizedDescription; inventoryPage = nil }
     }
@@ -504,15 +590,15 @@ struct LegacyVaultDetailView: View {
     private func folderReview(_ plan: FolderUploadPlan) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Review legacy vault upload").font(.title2.weight(.semibold))
-            Text("\(plan.items.count) archives → \(vault.vaultName) · \(region)")
-            Text("Threshold: \(plan.settings.thresholdMiB) MiB · Part size: \(plan.settings.partSizeMiB) MiB · Parallel requests: \(plan.settings.connections)").font(.caption)
+            Text("\(plan.items.count) archives → \(vault.vaultName) · \(region) · /\(plan.prefix)")
+            Text("Threshold: \(plan.settings.thresholdMiB) MiB · Part size: \(plan.settings.partSizeMiB) MiB · Multipart requests per file: \(plan.settings.connections) · Files at once: \(min(16, max(1, legacyParallelFiles)))").font(.caption)
             Text("Legacy Glacier stores independent archives, not folders. Paths are stored as archive descriptions; non-ASCII characters are replaced and descriptions are limited to 1,024 bytes. Parts are rounded up to a supported power-of-two size. Private snapshots and parallel parts require temporary disk space. Uploads incur AWS charges; empty files, folders and symbolic links are not supported.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             List(plan.items) { item in Text(item.key).font(.caption.monospaced()).textSelection(.enabled) }
             HStack {
                 Spacer()
                 Button("Cancel") { showFolderReview = false }
-                Button("Upload \(plan.items.count) files") { Task { await startFolderUpload(plan); showFolderReview = false } }
+                Button("Upload \(plan.items.count) files") { openQueueAfterReview = true; showFolderReview = false; Task { await startFolderUpload(plan) } }
                     .buttonStyle(.borderedProminent).disabled(busy || preparingFolderUpload)
             }
         }.padding(20).frame(width: 680, height: 520)
@@ -523,9 +609,32 @@ struct LegacyVaultDetailView: View {
         folderScopes = []; folderPlan = nil
     }
 
+    @MainActor private func chooseLegacyUpload() {
+        guard !busy, !preparingDrop else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK else { return }
+        let roots = panel.urls, prefix = currentInventoryFolder.isEmpty ? "" : currentInventoryFolder + "/"
+        for url in roots where url.startAccessingSecurityScopedResource() { folderScopes.append(url) }
+        var settings = UploadSettings(); settings.thresholdMiB = uploadThresholdMiB; settings.partSizeMiB = uploadPartSizeMiB; settings.connections = uploadConnections
+        preparingDrop = true
+        Task { @MainActor in
+            defer { preparingDrop = false }
+            do {
+                let plan = try await Task.detached(priority: .userInitiated) {
+                    try FolderUploadPlan.build(roots: roots, bucket: vault.vaultName, prefix: prefix, profile: profile, storageClass: "Legacy Glacier", settings: settings)
+                }.value
+                guard !busy, prefix == (currentInventoryFolder.isEmpty ? "" : currentInventoryFolder + "/") else { throw FolderUploadError.message("The destination changed while preparing the queue. Choose the files again.") }
+                folderPlan = plan; showFolderReview = true
+            } catch { releaseFolderScopes(); status = error.localizedDescription }
+        }
+    }
+
     private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
         guard !busy, !preparingDrop else { return false }
         var settings = UploadSettings(); settings.thresholdMiB = uploadThresholdMiB; settings.partSizeMiB = uploadPartSizeMiB; settings.connections = uploadConnections
+        let prefix = currentInventoryFolder.isEmpty ? "" : currentInventoryFolder + "/"
         preparingDrop = true
         Task { @MainActor in
             defer { preparingDrop = false }
@@ -545,9 +654,9 @@ struct LegacyVaultDetailView: View {
                     if url.startAccessingSecurityScopedResource() { folderScopes.append(url) }
                 }
                 let plan = try await Task.detached(priority: .userInitiated) {
-                    try FolderUploadPlan.build(roots: roots, bucket: vault.vaultName, prefix: "", profile: profile, storageClass: "Legacy Glacier", settings: settings)
+                    try FolderUploadPlan.build(roots: roots, bucket: vault.vaultName, prefix: prefix, profile: profile, storageClass: "Legacy Glacier", settings: settings)
                 }.value
-                guard !busy else { throw FolderUploadError.message("The vault is busy. Drop the folder again when it is ready.") }
+                guard !busy, prefix == (currentInventoryFolder.isEmpty ? "" : currentInventoryFolder + "/") else { throw FolderUploadError.message("The destination changed or the vault became busy. Drop the folder again.") }
                 folderPlan = plan; showFolderReview = true
             } catch { releaseFolderScopes(); status = error.localizedDescription }
         }
@@ -589,55 +698,17 @@ struct LegacyVaultDetailView: View {
         }
         durableQueue = queue
         uploadQueue = plan.items.map { QueuedUpload(item: $0) }
+        currentQueueIDs = Dictionary(uniqueKeysWithValues: zip(uploadQueue.map(\.id), session.items.map(\.id)))
         queueProgress = 0
         await refreshTransferHistory()
         queueTask = Task { @MainActor in
             defer {
                 for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() }
-                busy = false; queueTask = nil
+                busy = false; queueTask = nil; activeUploadToken = nil; activeUploadDetail = nil
             }
-            var completed = 0, failed = 0
-            var persistenceFailed = false
-            for index in plan.items.indices {
-                if Task.isCancelled { break }
-                let item = plan.items[index]
-                uploadQueue[index].state = "Preparing private snapshot"
-                status = "Uploading \(index + 1) of \(plan.items.count): \(item.key)"
-                queueProgress = Double(index) / Double(plan.items.count)
-                var snapshotURL: URL?
-                do {
-                    let snapshot = try await item.snapshot()
-                    snapshotURL = snapshot
-                    do {
-                        try await queue.updateItem(sessionID: sessionID, itemID: session.items[index].id, state: .inProgress,
-                            detail: "Upload request is starting. If interrupted, its result will be treated as unknown.")
-                    } catch { persistenceFailed = true; throw error }
-                    uploadQueue[index].state = "Uploading"
-                    let id = try await uploadService.uploadLegacyArchive(vault: vault.vaultName, region: region, file: snapshot, description: item.key, settings: plan.settings,
-                        progress: { fraction in Task { @MainActor in queueProgress = (Double(index) + fraction) / Double(plan.items.count) } })
-                    try await queue.updateItem(sessionID: sessionID, itemID: session.items[index].id, state: .completed,
-                        detail: "Archive ID: \(id)")
-                    saveUpload(id: id, filename: item.key)
-                    uploadQueue[index].state = "Complete · Archive ID: \(id)"; completed += 1
-                } catch {
-                    if let snapshotURL { try? FileManager.default.removeItem(at: snapshotURL.deletingLastPathComponent()) }
-                    let wasSubmitted = uploadQueue[index].state == "Uploading"
-                    let durableState: DurableTransferItem.State = wasSubmitted ? .outcomeUnknown : .failed
-                    let detail = wasSubmitted
-                        ? "Outcome unknown: \(error.localizedDescription). AWS may have created the archive; inspect the vault before any further action."
-                        : "Upload did not reach AWS: \(error.localizedDescription)"
-                    try? await queue.updateItem(sessionID: sessionID, itemID: session.items[index].id, state: durableState, detail: detail)
-                    uploadQueue[index].state = wasSubmitted ? detail : "Failed: \(error.localizedDescription)"
-                    if Task.isCancelled || wasSubmitted || persistenceFailed { failed += 1; break }
-                    failed += 1
-                }
-                if let snapshotURL { try? FileManager.default.removeItem(at: snapshotURL.deletingLastPathComponent()) }
-            }
-            if Task.isCancelled {
-                for index in uploadQueue.indices where uploadQueue[index].state == "Queued" { uploadQueue[index].state = "Cancelled" }
-                status = "Queue cancelled: \(completed) uploaded, \(failed) failed. Review any incomplete-upload messages."
-            } else { queueProgress = 1; status = "Queue finished: \(completed) uploaded, \(failed) failed." }
+            let completed = await runParallelLegacy(items: plan.items, records: session.items, sessionID: sessionID, settings: plan.settings, queue: queue, service: uploadService)
             await refreshTransferHistory()
+            if completed > 0 && inventoryDate != nil { inventoryFolders = nil; await loadInventoryPage() }
         }
     }
 
@@ -657,6 +728,26 @@ struct LegacyVaultDetailView: View {
         let queue = try DurableTransferQueue.shared(fileURL: root.appendingPathComponent("GlacierDesk/transfers.sqlite"))
         durableQueue = queue
         return queue
+    }
+
+    private var hasResumableItems: Bool {
+        durableTransferHistory.contains { session in
+            session.items.contains { item in (item.state == .queued || item.state == .failed) && (selectedQueueItems.isEmpty || selectedQueueItems.contains(item.id)) }
+        }
+    }
+
+    @MainActor private func prepareResume() async {
+        await refreshTransferHistory()
+        let eligibleSessions = durableTransferHistory.filter { session in
+            session.items.contains { item in (item.state == .queued || item.state == .failed) && (selectedQueueItems.isEmpty || selectedQueueItems.contains(item.id)) }
+        }
+        let currentIDs = Set(currentQueueIDs.values)
+        let session = eligibleSessions.last(where: { $0.items.contains { currentIDs.contains($0.id) } }) ?? eligibleSessions.last
+        guard let session else { status = "No eligible pending or failed files to resume."; return }
+        if !selectedQueueItems.isEmpty && eligibleSessions.count > 1 {
+            status = "Select files from one saved queue at a time to resume."; return
+        }
+        await prepareLegacyRetryReview(session)
     }
 
     private var legacyRetryReviewText: String {
@@ -686,8 +777,10 @@ struct LegacyVaultDetailView: View {
             }
             let queue = try getDurableTransferQueue()
             let eligible = try await queue.retryableItems(sessionID: session.id, selectedProfile: profile, currentAccountID: identity.account)
+            let selected = selectedQueueItems.isEmpty ? eligible : eligible.filter { selectedQueueItems.contains($0.id) }
+            guard !selected.isEmpty else { throw DurableTransferQueueError.noRetryableItems }
             reviewedLegacyRetrySession = session
-            reviewedLegacyRetryItems = eligible
+            reviewedLegacyRetryItems = selected
             confirmLegacyRetry = true
         } catch {
             status = "Could not prepare a safe retry review: \(error.localizedDescription)"
@@ -715,8 +808,9 @@ struct LegacyVaultDetailView: View {
                 throw DurableTransferQueueError.accountMismatch(expected: accountID, actual: identity.account)
             }
             let queue = try getDurableTransferQueue()
-            let records = try await queue.retryableItems(sessionID: reviewedSession.id, selectedProfile: profile, currentAccountID: identity.account)
+            let eligible = try await queue.retryableItems(sessionID: reviewedSession.id, selectedProfile: profile, currentAccountID: identity.account)
             let reviewedIDs = Set(reviewedLegacyRetryItems.map(\.id))
+            let records = eligible.filter { reviewedIDs.contains($0.id) }
             guard !records.isEmpty, Set(records.map(\.id)) == reviewedIDs else {
                 throw DurableTransferQueueError.noRetryableItems
             }
@@ -741,69 +835,117 @@ struct LegacyVaultDetailView: View {
             settings.thresholdMiB = threshold; settings.partSizeMiB = partSize; settings.connections = connections
             let uploadService = service
             uploadQueue = items.map { QueuedUpload(item: $0) }
+            currentQueueIDs = Dictionary(uniqueKeysWithValues: zip(uploadQueue.map(\.id), records.map(\.id)))
             queueProgress = 0
             clearLegacyRetryReview()
             queueTask = Task { @MainActor in
                 defer {
                     for (url, active) in scopes where active { url.stopAccessingSecurityScopedResource() }
-                    busy = false; queueTask = nil
+                    busy = false; queueTask = nil; activeUploadToken = nil; activeUploadDetail = nil
                 }
-                var completed = 0, failed = 0
-                var persistenceFailed = false
-                for (index, pair) in zip(records, items).enumerated() {
-                    if Task.isCancelled { break }
-                    let (record, item) = pair
-                    var snapshotURL: URL?
-                    uploadQueue[index].state = "Preparing private snapshot"
-                    status = "Retrying \(index + 1) of \(items.count): \(record.target)"
-                    queueProgress = Double(index) / Double(items.count)
-                    do {
-                        let snapshot = try await item.snapshot()
-                        snapshotURL = snapshot
-                        do {
-                            try await queue.updateItem(sessionID: reviewedSession.id, itemID: record.id, state: .inProgress,
-                                detail: "Reviewed retry is starting. If interrupted, the result will be treated as unknown.")
-                        } catch { persistenceFailed = true; throw error }
-                        uploadQueue[index].state = "Uploading"
-                        let archiveID = try await uploadService.uploadLegacyArchive(vault: vault.vaultName, region: region,
-                            file: snapshot, description: item.key, settings: settings,
-                            progress: { fraction in Task { @MainActor in queueProgress = (Double(index) + fraction) / Double(items.count) } })
-                        try await queue.updateItem(sessionID: reviewedSession.id, itemID: record.id, state: .completed,
-                            detail: "Archive ID: \(archiveID)")
-                        saveUpload(id: archiveID, filename: item.key)
-                        uploadQueue[index].state = "Complete · Archive ID: \(archiveID)"
-                        completed += 1
-                    } catch {
-                        if let snapshotURL { try? FileManager.default.removeItem(at: snapshotURL.deletingLastPathComponent()) }
-                        let submitted = uploadQueue[index].state == "Uploading"
-                        let state: DurableTransferItem.State = submitted ? .outcomeUnknown : .failed
-                        let detail = submitted
-                            ? "Outcome unknown: \(error.localizedDescription). AWS may have created the archive; inspect Glacier before any manual action."
-                            : "Retry did not reach AWS: \(error.localizedDescription)"
-                        do {
-                            try await queue.updateItem(sessionID: reviewedSession.id, itemID: record.id, state: state, detail: detail)
-                        } catch { persistenceFailed = true }
-                        uploadQueue[index].state = detail
-                        failed += 1
-                        if Task.isCancelled || submitted || persistenceFailed { break }
-                    }
-                    if let snapshotURL { try? FileManager.default.removeItem(at: snapshotURL.deletingLastPathComponent()) }
-                }
-                if Task.isCancelled {
-                    status = "Legacy retry cancelled: \(completed) uploaded, \(failed) failed or uncertain. Review transfer history before continuing."
-                } else if failed > 0 || persistenceFailed {
-                    status = "Legacy retry stopped: \(completed) uploaded, \(failed) failed or uncertain. Review transfer history before continuing."
-                } else {
-                    queueProgress = 1
-                    status = "Reviewed legacy retry finished: \(completed) uploaded."
-                }
+                let completed = await runParallelLegacy(items: items, records: records, sessionID: reviewedSession.id, settings: settings, queue: queue, service: uploadService)
                 await refreshTransferHistory()
+                if completed > 0 && inventoryDate != nil { inventoryFolders = nil; await loadInventoryPage() }
             }
         } catch {
             for (url, active) in scopes where active { url.stopAccessingSecurityScopedResource() }
             busy = false
             status = "Could not retry saved legacy items: \(error.localizedDescription). No retry was started unless a result is marked outcome unknown."
             clearLegacyRetryReview()
+        }
+    }
+
+    /// Keep a bounded number of files active; each service call independently limits multipart requests.
+    @MainActor private func runParallelLegacy(items: [FolderUploadItem], records: [DurableTransferItem], sessionID: UUID,
+                                               settings: UploadSettings, queue: DurableTransferQueue, service: AWSService) async -> Int {
+        let limit = min(16, max(1, legacyParallelFiles)), total = items.count
+        var next = 0, finished = 0, succeeded = 0, failures = 0, stopScheduling = false
+        status = "Uploading up to \(limit) files at once · up to \(settings.connections) multipart requests per file"
+        await withTaskGroup(of: (Bool, Bool).self) { group in
+            func schedule(_ index: Int) {
+                group.addTask { @MainActor in
+                    await uploadLegacyQueueItem(index: index, item: items[index], record: records[index], sessionID: sessionID, settings: settings, queue: queue, service: service)
+                }
+            }
+            while next < min(limit, total) { schedule(next); next += 1 }
+            while let (success, uncertain) = await group.next() {
+                finished += 1
+                if success { succeeded += 1 } else { failures += 1 }
+                if uncertain { stopScheduling = true }
+                queueProgress = Double(finished) / Double(max(1, total))
+                status = "\(finished) of \(total) processed · \(succeeded) uploaded · \(failures) failed or cancelled"
+                if Task.isCancelled { group.cancelAll(); stopScheduling = true }
+                if !stopScheduling && next < total { schedule(next); next += 1 }
+            }
+        }
+        if Task.isCancelled { status = "Transfers stopped. Pending files remain queued; review uncertain results." }
+        else if stopScheduling { status = "Queue stopped after an uncertain upload. Review its result before retrying; pending files remain queued." }
+        else { status = "Queue finished: \(succeeded) uploaded, \(failures) failed or cancelled." }
+        return succeeded
+    }
+
+    @MainActor private func uploadLegacyQueueItem(index: Int, item: FolderUploadItem, record: DurableTransferItem,
+                                                  sessionID: UUID, settings: UploadSettings, queue: DurableTransferQueue,
+                                                  service: AWSService) async -> (Bool, Bool) {
+        guard !Task.isCancelled else { return (false, false) }
+        do {
+            guard try await queue.claimLegacyItem(sessionID: sessionID, itemID: record.id) else {
+                uploadQueue[index].state = "Cancelled"; return (false, false)
+            }
+        } catch { uploadQueue[index].state = "Queue error: \(error.localizedDescription)"; return (false, true) }
+        uploadQueue[index].state = "Preparing private snapshot"
+        var snapshotURL: URL?, submitted = false
+        defer { if let snapshotURL { try? FileManager.default.removeItem(at: snapshotURL.deletingLastPathComponent()) } }
+        do {
+            let snapshot = try await item.snapshot(); snapshotURL = snapshot
+            try Task.checkCancellation()
+            try await queue.updateItem(sessionID: sessionID, itemID: record.id, state: .inProgress, detail: "Upload request is starting; an interrupted result may be unknown.")
+            submitted = true
+            uploadQueue[index].state = "Uploading"
+            let archiveID = try await service.uploadLegacyArchive(vault: vault.vaultName, region: region, file: snapshot, description: item.key, settings: settings,
+                status: { update in Task { @MainActor in
+                    guard uploadQueue.indices.contains(index), uploadQueue[index].id == item.id,
+                          uploadQueue[index].state.hasPrefix("Uploading") else { return }
+                    uploadQueue[index].state = "Uploading · " + Self.describeUpload(update)
+                } })
+            try await queue.updateItem(sessionID: sessionID, itemID: record.id, state: .completed, detail: "Archive ID: \(archiveID)")
+            saveUpload(id: archiveID, filename: item.key)
+            uploadQueue[index].state = "Complete · Archive ID: \(archiveID)"
+            return (true, false)
+        } catch {
+            let state: DurableTransferItem.State = submitted ? .outcomeUnknown : .failed
+            let detail = submitted ? "Outcome unknown: \(error.localizedDescription). Inspect Glacier before retrying." : "Upload did not reach AWS: \(error.localizedDescription)"
+            do { try await queue.updateItem(sessionID: sessionID, itemID: record.id, state: state, detail: detail) }
+            catch { uploadQueue[index].state = "Queue persistence failed; inspect AWS before retrying."; return (false, true) }
+            uploadQueue[index].state = detail
+            return (false, submitted)
+        }
+    }
+
+    @MainActor private func editQueue(clear: Bool) async {
+        guard !clearingPendingQueue, !clear || queueTask == nil else { return }
+        clearingPendingQueue = true
+        defer { clearingPendingQueue = false }
+        do {
+            let queue = try getDurableTransferQueue()
+            let count = try await queue.editLegacyQueue(profile: profile, accountID: accountID, region: region, vault: vault.vaultName, selected: selectedQueueItems, clear: clear)
+            if clear { uploadQueue.removeAll(); selectedQueueItems.removeAll() }
+            await refreshTransferHistory()
+            if !clear {
+                let cancelledTargets = Set(durableTransferHistory.flatMap(\.items).filter { $0.state == .cancelled }.map(\.target))
+                for index in uploadQueue.indices where uploadQueue[index].state == "Queued" && cancelledTargets.contains(uploadQueue[index].item.key) { uploadQueue[index].state = "Cancelled" }
+            }
+            status = clear ? "Cleared \(count) finished items; uncertain uploads remain in history." : "Cancelled \(count) pending items. Active transfers continue."
+        } catch { status = "Could not update the queue: \(error.localizedDescription)" }
+    }
+
+    private static func describeUpload(_ status: LegacyUploadStatus) -> String {
+        switch status {
+        case .preparing(let multipart): return "\(multipart ? "Multipart" : "Single request") · calculating checksum…"
+        case .singleRequest: return "Single request · uploading (part progress not available)"
+        case let .multipart(completed, total, partSize, connections):
+            return "Multipart · \(completed) of \(total) parts complete · \(ByteCountFormatter.string(fromByteCount: partSize, countStyle: .binary)) per part · up to \(connections) parallel requests"
+        case .completing: return "Multipart · all parts uploaded; confirming archive with AWS…"
         }
     }
 

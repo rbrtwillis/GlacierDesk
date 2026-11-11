@@ -37,7 +37,7 @@ struct DurableTransferSession: Codable, Equatable, Identifiable, Sendable {
 /// Bookmark and file identity are retained for later reauthorization. `sourcePath` is
 /// informational; callers must resolve the bookmark and verify identity before opening it.
 struct DurableTransferItem: Codable, Equatable, Identifiable, Sendable {
-    enum State: String, Codable, Sendable { case queued, inProgress, completed, failed, interrupted, outcomeUnknown }
+    enum State: String, Codable, Sendable { case queued, inProgress, completed, failed, interrupted, outcomeUnknown, cancelled }
 
     let id: UUID
     let sourcePath: String
@@ -252,6 +252,50 @@ actor DurableTransferQueue {
         }
     }
 
+    /// Remove only never-started legacy items for this exact vault and account.
+    /// Active and uncertain uploads must remain in history for reconciliation.
+    func clearPendingLegacy(profile: String, accountID: String, region: String, vault: String) throws -> Int {
+        let db = try requireDatabase()
+        try withStatement(db, """
+            DELETE FROM items WHERE state='queued' AND session_id IN (
+                SELECT id FROM sessions WHERE kind='legacyArchiveUpload' AND profile=? AND account_id=? AND region=? AND vault=?
+            )
+            """) { statement in
+            Self.bind(profile, to: statement, at: 1); Self.bind(accountID, to: statement, at: 2)
+            Self.bind(region, to: statement, at: 3); Self.bind(vault, to: statement, at: 4)
+            try Self.step(statement, db: db)
+        }
+        return Int(sqlite3_changes(db))
+    }
+
+    /// Cancel or clear only eligible rows in the displayed vault. Unknown outcomes are retained.
+    func editLegacyQueue(profile: String, accountID: String, region: String, vault: String,
+                         selected: Set<UUID>, clear: Bool) throws -> Int {
+        let db = try requireDatabase()
+        let action = clear ? "DELETE FROM items" : "UPDATE items SET state='cancelled', detail='Cancelled by operator', updated_at=\(Date().timeIntervalSince1970)"
+        let states = clear ? "('cancelled','completed','failed')" : "('queued')"
+        let filter = selected.isEmpty ? "" : " AND id IN (" + Array(repeating: "?", count: selected.count).joined(separator: ",") + ")"
+        let sql = action + " WHERE state IN " + states + " AND session_id IN (SELECT id FROM sessions WHERE kind='legacyArchiveUpload' AND profile=? AND account_id=? AND region=? AND vault=?)" + filter
+        try withStatement(db, sql) { statement in
+            Self.bind(profile, to: statement, at: 1); Self.bind(accountID, to: statement, at: 2)
+            Self.bind(region, to: statement, at: 3); Self.bind(vault, to: statement, at: 4)
+            for (index, id) in selected.sorted(by: { $0.uuidString < $1.uuidString }).enumerated() { Self.bind(id.uuidString, to: statement, at: Int32(index + 5)) }
+            try Self.step(statement, db: db)
+        }
+        return Int(sqlite3_changes(db))
+    }
+
+    /// Atomically claim an eligible item so cancellation cannot be overwritten by the uploader.
+    func claimLegacyItem(sessionID: UUID, itemID: UUID) throws -> Bool {
+        let db = try requireDatabase()
+        try withStatement(db, "UPDATE items SET state='inProgress', detail='Preparing upload', updated_at=? WHERE session_id=? AND id=? AND state IN ('queued','failed')") { statement in
+            sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970)
+            Self.bind(sessionID.uuidString, to: statement, at: 2); Self.bind(itemID.uuidString, to: statement, at: 3)
+            try Self.step(statement, db: db)
+        }
+        return sqlite3_changes(db) == 1
+    }
+
     func authorize(sessionID: UUID, selectedProfile: String, currentAccountID: String) throws {
         guard let session = try allSessions().first(where: { $0.id == sessionID }) else { return }
         guard session.accountID == currentAccountID else { throw DurableTransferQueueError.accountMismatch(expected: session.accountID, actual: currentAccountID) }
@@ -270,7 +314,7 @@ actor DurableTransferQueue {
             case .interrupted:
                 if session.kind == .s3Upload { return confirmInterruptedS3 }
                 return session.kind == .legacyDownload
-            case .inProgress, .completed, .outcomeUnknown: return false
+            case .inProgress, .completed, .outcomeUnknown, .cancelled: return false
             }
         }
         guard !eligible.isEmpty else { throw DurableTransferQueueError.noRetryableItems }
