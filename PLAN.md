@@ -37,6 +37,10 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 - [ ] Revisit the sidebar bucket list when improving the S3 interface. Consider moving bucket navigation into the S3 Browse experience so it does not take space or appear to be loading while working with legacy vaults. Fix loading, empty, error, and collapsed states; keep long bucket names usable and retain access to all buckets. Verify the behavior when switching between S3 and legacy vaults, reconnecting, and resizing the window.
 
+## Legacy vault protection
+
+- [ ] Add a WORM protection workflow for legacy Glacier vaults using AWS Vault Lock policies. Allow users to inspect the current lock state, configure and preview a retention policy that enforces the intended write-once/read-many restrictions, and review the account, Region, vault, retention period, and affected operations. Support the separate initiation and completion steps, explain the 24-hour initiation window, and make the permanent, irreversible effect of completing a lock unmistakable before explicit confirmation. Handle existing locks, failed or expired initiation, permissions, and policy validation; test with simulated AWS responses without locking a live vault.
+
 ## Next milestones
 
 1. Validate browse, upload, download, restore, and lifecycle flows against a dedicated AWS account and bucket, including permissions, SSO expiration, interruptions, and cost behavior.
