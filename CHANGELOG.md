@@ -4,12 +4,14 @@ Notable user-visible changes are recorded here. Add new work under **Unreleased*
 
 ## Unreleased
 
+No changes recorded yet.
+
+## 0.3.0 — 2026-11-11
+
 - Browse large legacy inventories through disk-backed, paged folder listings instead of retaining the full vault tree in memory.
 - Monitor opted-in vault inventories in the background while the app remains open and connected to the original account.
 - Show active file and part-task counts and aggregate AWS request timings for uploads; add an opt-in macOS network capacity test.
 - Add simulated concurrent stop and resume coverage and background inventory capture tests.
-
-## 0.3.0 — 2026-11-11
 
 - Add graceful legacy queue stopping and a separate immediate cancellation action.
 - Allow selected uncertain legacy upload records to be cleared locally after explicit review.
