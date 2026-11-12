@@ -4,7 +4,7 @@ Copyright © 2026 WillisLabs.ai. Licensed under the Apache License, Version 2.0.
 
 ## Current checkpoint
 
-GlacierDesk 0.3 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, account-scoped local inventory indexing, verified downloads, and file and folder uploads with multipart support. Live-vault validation remains outstanding.
+GlacierDesk 0.3 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, account-scoped local inventory indexing, verified downloads, and file and folder uploads with multipart support. The user has confirmed basic uploads and deletions against a live legacy vault; broader live-vault and end-to-end validation remains outstanding.
 
 Uploads have configurable multipart settings. Folder queue records persist across restarts and eligible files can be explicitly retried after reconnecting the original account; retries restart files rather than resuming uploaded parts. Unknown legacy upload outcomes require manual inspection. Downloads use a temporary destination before replacing the final file. Restore requests made by the app are stored locally and refreshed for the matching account and profile while the app runs; the current restore duration is three days.
 
@@ -41,7 +41,7 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 ## Validation and release to-do
 
-- [ ] Validate browsing, upload, download, restore, lifecycle rules, and legacy vault workflows in a specifically authorized AWS test account and bucket, including permission failures, expired SSO sessions, interruptions, and costs.
+- [ ] Expand live validation beyond the user-confirmed basic legacy uploads and deletions: test browsing, upload, download, restore, lifecycle rules, deletion edge cases, and recovery in a specifically authorized AWS test account and bucket, including permission failures, expired SSO sessions, interruptions, and costs.
 - [ ] Expand automated integration and unit tests for redaction, profile and account isolation, lifecycle preservation, transfer concurrency and cancellation, restore status, and recovery across restarts.
 - [ ] Improve restores with configurable duration, expiration and status, recovery after interrupted submissions, and discovery or import of requests initiated elsewhere.
 - [ ] Complete security, dependency, and secret-scanning reviews; verify CI, accessibility, and light/dark appearance.

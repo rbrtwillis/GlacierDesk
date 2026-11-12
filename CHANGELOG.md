@@ -8,6 +8,8 @@ No changes recorded yet.
 
 ## 0.3.0 — 2026-11-11
 
+Validation: the user confirmed basic uploads and deletions against a live legacy vault. Broader end-to-end and failure-case validation remains outstanding.
+
 - Add reviewed permanent deletion for selected legacy archives and nested folders.
 
 - Organize legacy vault actions into Browse, Jobs, Uploads, and Retrieve sections.
