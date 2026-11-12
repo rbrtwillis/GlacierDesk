@@ -6,6 +6,13 @@ Notable user-visible changes are recorded here. Add new work under **Unreleased*
 
 No changes recorded yet.
 
+## 0.3.0 — 2026-11-11
+
+- Add graceful legacy queue stopping and a separate immediate cancellation action.
+- Allow selected uncertain legacy upload records to be cleared locally after explicit review.
+- Add opt-in capture of completed Glacier inventory jobs and prevent older snapshots replacing newer cached inventories.
+- Show upload throughput and preparation timings, and add an opt-in S3 upload speed test.
+
 ## 0.2.0 — 2026-11-10
 
 ### Added

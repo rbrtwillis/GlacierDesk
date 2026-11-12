@@ -109,4 +109,14 @@ final class InventoryIndexTests: XCTestCase {
         try index.replaceInventory(scope: scope, archives: [IndexedGlacierArchive(archiveID: "new")])
         XCTAssertEqual(try index.snapshot(scope: scope)?.archiveCount, 1)
     }
+    func testOlderInventoryDoesNotReplaceNewerSnapshot() throws {
+        let (index, directory, scope) = try makeIndex()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("inventory.json")
+        try JSONSerialization.data(withJSONObject: ["InventoryDate":"2026-11-11T00:00:00Z", "ArchiveList":[["ArchiveId":"new"]]]).write(to: file)
+        _ = try index.importInventoryJSON(at: file, scope: scope)
+        try JSONSerialization.data(withJSONObject: ["InventoryDate":"2026-11-10T00:00:00Z", "ArchiveList":[["ArchiveId":"old"]]]).write(to: file)
+        XCTAssertThrowsError(try index.importInventoryJSON(at: file, scope: scope))
+        XCTAssertEqual(try index.search(scope: scope).archives.map(\.archiveID), ["new"])
+    }
 }

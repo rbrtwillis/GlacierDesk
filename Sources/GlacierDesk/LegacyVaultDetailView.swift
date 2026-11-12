@@ -54,6 +54,9 @@ struct LegacyVaultDetailView: View {
     @State private var uploadFile: URL?
     @AppStorage("legacyUploadedArchives") private var uploadedData = Data()
     @AppStorage("legacyJobNotificationsEnabled") private var jobNotificationsEnabled = false
+    @AppStorage("legacyAutoCaptureInventory") private var autoCaptureInventory = false
+    @AppStorage("legacyCapturedInventoryJobs") private var capturedJobsData = Data()
+    @State private var attemptedAutoCapture = Set<String>()
     @AppStorage("uploadThresholdMiB") private var uploadThresholdMiB = 64
     @AppStorage("uploadPartSizeMiB") private var uploadPartSizeMiB = 16
     @AppStorage("uploadConnections") private var uploadConnections = 4
@@ -65,7 +68,14 @@ struct LegacyVaultDetailView: View {
     @State private var dropTargeted = false
     @State private var uploadQueue: [QueuedUpload] = []
     @State private var queueTask: Task<Void, Never>?
+    @State private var stopRequested = false
+    @State private var confirmClearUnknown = false
     @State private var queueProgress: Double = 0
+    @State private var uploadStartedAt: Date?
+    @State private var uploadBytesByItem: [UUID: Int64] = [:]
+    @State private var uploadTimeByItem: [UUID: Date] = [:]
+    @State private var uploadChecksumStart: [UUID: Date] = [:]
+    @State private var uploadStageSummary: [UUID: String] = [:]
     @State private var activeUploadDetail: String?
     @State private var activeUploadToken: UUID?
     @State private var preparingFolderUpload = false
@@ -119,7 +129,7 @@ struct LegacyVaultDetailView: View {
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("Request inventory…") { confirmInventory = true }.disabled(busy)
-                    Button("Refresh jobs") { Task { await refresh() } }.disabled(busy)
+                    Button("Refresh jobs") { Task { await refresh(); await captureCompletedInventoryIfEnabled() } }.disabled(busy)
                     Button("Upload files or folders…") { chooseLegacyUpload() }.disabled(busy)
                     if busy { ProgressView().controlSize(.small) }
                 }
@@ -127,7 +137,7 @@ struct LegacyVaultDetailView: View {
                     .font(.caption).foregroundStyle(GlacierTheme.accent)
                 if !uploadQueue.isEmpty {
                     ProgressView(value: queueProgress)
-                    if queueTask != nil { Button("Cancel queue") { queueTask?.cancel() } }
+                    if queueTask != nil { Button("Stop after active files") { stopRequested = true } }
                     ForEach(uploadQueue) { entry in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(entry.item.key).font(.caption.monospaced()).textSelection(.enabled)
@@ -139,6 +149,10 @@ struct LegacyVaultDetailView: View {
                 if let status { Text(status).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 Divider()
                 Text("Jobs").font(.headline)
+                Toggle("Automatically cache completed inventory jobs while this vault is open", isOn: $autoCaptureInventory)
+                    .toggleStyle(.checkbox).font(.caption)
+                    .onChange(of: autoCaptureInventory) { enabled in if enabled { Task { await captureCompletedInventoryIfEnabled() } } }
+                Text("Automatic capture downloads job output and may incur AWS charges. The cached snapshot remains on this Mac after AWS output expires.").font(.caption).foregroundStyle(.secondary)
                 Toggle("Notify me when a Glacier job finishes", isOn: $jobNotificationsEnabled)
                     .toggleStyle(.checkbox)
                     .font(.caption)
@@ -312,16 +326,27 @@ struct LegacyVaultDetailView: View {
                 if let status { Text(status).textSelection(.enabled) }
                 if queueTask != nil {
                     ProgressView("Overall queue", value: queueProgress)
+                    if let started = uploadStartedAt {
+                        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                            let bytes = uploadBytesByItem.values.reduce(Int64(0), +)
+                            let elapsed = max(1, timeline.date.timeIntervalSince(started))
+                            Text("Confirmed transferred: \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .binary)) · average \(ByteCountFormatter.string(fromByteCount: Int64(Double(bytes) / elapsed), countStyle: .binary))/s · \(Int(elapsed)) s elapsed")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     if let activeUploadDetail { Text(activeUploadDetail).font(.callout).textSelection(.enabled) }
                 }
                 HStack {
-                    Button("Stop all active transfers") { queueTask?.cancel() }.disabled(queueTask == nil)
+                    Button(stopRequested ? "Stopping…" : "Stop after active files") { stopRequested = true }.disabled(queueTask == nil || stopRequested)
+                    Button("Cancel active now") { queueTask?.cancel() }.disabled(queueTask == nil)
                     Button("Resume…") { Task { await prepareResume() } }
                         .disabled(busy || queueTask != nil || clearingPendingQueue || !hasResumableItems)
                     Button(selectedQueueItems.isEmpty ? "Cancel all pending" : "Cancel selected pending") { Task { await editQueue(clear: false) } }
                         .disabled(clearingPendingQueue)
                     Button(selectedQueueItems.isEmpty ? "Clear finished" : "Clear selected finished") { Task { await editQueue(clear: true) } }
                         .disabled(clearingPendingQueue || queueTask != nil)
+                    Button("Clear selected uncertain…") { confirmClearUnknown = true }
+                        .disabled(queueTask != nil || clearingPendingQueue || !durableTransferHistory.flatMap(\.items).contains { $0.state == .outcomeUnknown && selectedQueueItems.contains($0.id) })
                     Spacer()
                 }
                 Text("Select items below to act on individual files; with nothing selected, actions apply to all eligible files. Clear removes completed, failed, and cancelled items; uncertain results remain for inspection.")
@@ -371,6 +396,10 @@ struct LegacyVaultDetailView: View {
                     Button("Done") { showTransferHistory = false }
                 }
             }.padding(18).frame(minWidth: 620, minHeight: 440)
+            .confirmationDialog("Clear uncertain records?", isPresented: $confirmClearUnknown, titleVisibility: .visible) {
+                Button("I reviewed them — clear selected records", role: .destructive) { Task { await clearSelectedUnknown() } }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("This removes only selected local records. It does not abort multipart uploads or remove archives in AWS. Check the account, Region, vault, and upload IDs shown in the records before clearing.") }
             .confirmationDialog("Retry selected legacy folder uploads?", isPresented: $confirmLegacyRetry, titleVisibility: .visible) {
                 Button("I reviewed the risks — retry \(reviewedLegacyRetryItems.count) items") {
                     guard let session = reviewedLegacyRetrySession else { return }
@@ -380,13 +409,15 @@ struct LegacyVaultDetailView: View {
             } message: { Text(legacyRetryReviewText) }
         ))
         .task {
-            await refresh()
             await restoreCachedInventory()
+            await refresh()
+            await captureCompletedInventoryIfEnabled()
             await refreshTransferHistory()
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(60)) } catch { break }
                 guard jobs.contains(where: { $0.statusCode == "InProgress" }) else { continue }
                 await refresh(automatic: true)
+                await captureCompletedInventoryIfEnabled()
             }
         }
         .fileImporter(isPresented: $showingFilePicker, allowedContentTypes: [.item]) { result in
@@ -483,6 +514,21 @@ struct LegacyVaultDetailView: View {
             status = nil
         } catch { status = "S3 listing or comparison failed: \(error.localizedDescription)" }
     }
+    @MainActor private func captureCompletedInventoryIfEnabled() async {
+        guard autoCaptureInventory, !busy else { return }
+        let scopeKey = [profile, accountID, region, vault.vaultName].joined(separator: "\u{0}")
+        let captured = (try? JSONDecoder().decode([String: String].self, from: capturedJobsData)) ?? [:]
+        guard let job = jobs.filter({ $0.action == "InventoryRetrieval" && $0.statusCode == "Succeeded" && $0.creationDate != nil }).max(by: { ($0.creationDate ?? "") < ($1.creationDate ?? "") }),
+              captured[scopeKey] != job.jobId, !attemptedAutoCapture.contains(job.jobId) else { return }
+        if let date = inventoryDate, date != "Unknown", let created = job.creationDate, created < date { return }
+        attemptedAutoCapture.insert(job.jobId)
+        await openInventory(job)
+        if status == "Inventory loaded and indexed." {
+            var updated = captured; updated[scopeKey] = job.jobId
+            if let data = try? JSONEncoder().encode(updated) { capturedJobsData = data }
+        } else { jobRefreshError = "Automatic inventory capture failed. Use Open inventory to retry: \(status ?? "Unknown error")" }
+    }
+
     @MainActor private func requestInventory() async {
         busy = true; defer { busy = false }
         do {
@@ -699,7 +745,7 @@ struct LegacyVaultDetailView: View {
         durableQueue = queue
         uploadQueue = plan.items.map { QueuedUpload(item: $0) }
         currentQueueIDs = Dictionary(uniqueKeysWithValues: zip(uploadQueue.map(\.id), session.items.map(\.id)))
-        queueProgress = 0
+        queueProgress = 0; stopRequested = false
         await refreshTransferHistory()
         queueTask = Task { @MainActor in
             defer {
@@ -836,7 +882,7 @@ struct LegacyVaultDetailView: View {
             let uploadService = service
             uploadQueue = items.map { QueuedUpload(item: $0) }
             currentQueueIDs = Dictionary(uniqueKeysWithValues: zip(uploadQueue.map(\.id), records.map(\.id)))
-            queueProgress = 0
+            queueProgress = 0; stopRequested = false
             clearLegacyRetryReview()
             queueTask = Task { @MainActor in
                 defer {
@@ -859,6 +905,7 @@ struct LegacyVaultDetailView: View {
     @MainActor private func runParallelLegacy(items: [FolderUploadItem], records: [DurableTransferItem], sessionID: UUID,
                                                settings: UploadSettings, queue: DurableTransferQueue, service: AWSService) async -> Int {
         let limit = min(16, max(1, legacyParallelFiles)), total = items.count
+        uploadStartedAt = Date(); uploadBytesByItem = [:]; uploadTimeByItem = [:]; uploadChecksumStart = [:]; uploadStageSummary = [:]
         var next = 0, finished = 0, succeeded = 0, failures = 0, stopScheduling = false
         status = "Uploading up to \(limit) files at once · up to \(settings.connections) multipart requests per file"
         await withTaskGroup(of: (Bool, Bool).self) { group in
@@ -875,10 +922,12 @@ struct LegacyVaultDetailView: View {
                 queueProgress = Double(finished) / Double(max(1, total))
                 status = "\(finished) of \(total) processed · \(succeeded) uploaded · \(failures) failed or cancelled"
                 if Task.isCancelled { group.cancelAll(); stopScheduling = true }
+                if stopRequested { stopScheduling = true }
                 if !stopScheduling && next < total { schedule(next); next += 1 }
             }
         }
         if Task.isCancelled { status = "Transfers stopped. Pending files remain queued; review uncertain results." }
+        else if stopRequested { status = "Stopped after active files finished. Pending files remain queued for Resume." }
         else if stopScheduling { status = "Queue stopped after an uncertain upload. Review its result before retrying; pending files remain queued." }
         else { status = "Queue finished: \(succeeded) uploaded, \(failures) failed or cancelled." }
         return succeeded
@@ -894,6 +943,7 @@ struct LegacyVaultDetailView: View {
             }
         } catch { uploadQueue[index].state = "Queue error: \(error.localizedDescription)"; return (false, true) }
         uploadQueue[index].state = "Preparing private snapshot"
+        uploadTimeByItem[item.id] = Date()
         var snapshotURL: URL?, submitted = false
         defer { if let snapshotURL { try? FileManager.default.removeItem(at: snapshotURL.deletingLastPathComponent()) } }
         do {
@@ -906,9 +956,22 @@ struct LegacyVaultDetailView: View {
                 status: { update in Task { @MainActor in
                     guard uploadQueue.indices.contains(index), uploadQueue[index].id == item.id,
                           uploadQueue[index].state.hasPrefix("Uploading") else { return }
-                    uploadQueue[index].state = "Uploading · " + Self.describeUpload(update)
+                    if case .preparing = update {
+                        let snapshotTime = Date().timeIntervalSince(uploadTimeByItem[item.id] ?? Date())
+                        uploadChecksumStart[item.id] = Date()
+                        uploadStageSummary[item.id] = "snapshot \(String(format: "%.1f", snapshotTime))s"
+                    } else if uploadChecksumStart[item.id] != nil {
+                        let hashTime = Date().timeIntervalSince(uploadChecksumStart[item.id]!)
+                        uploadStageSummary[item.id, default: ""] += " · checksum \(String(format: "%.1f", hashTime))s"
+                        uploadChecksumStart[item.id] = nil
+                    }
+                    if case let .multipart(_, _, _, _, bytes) = update { uploadBytesByItem[item.id] = bytes }
+                    let elapsed = max(1, Date().timeIntervalSince(uploadTimeByItem[item.id] ?? Date()))
+                    let bytes = uploadBytesByItem[item.id] ?? 0
+                    uploadQueue[index].state = "Uploading · " + Self.describeUpload(update) + " · avg \(ByteCountFormatter.string(fromByteCount: Int64(Double(bytes) / elapsed), countStyle: .binary))/s (including preparation) · " + (uploadStageSummary[item.id] ?? "")
                 } })
             try await queue.updateItem(sessionID: sessionID, itemID: record.id, state: .completed, detail: "Archive ID: \(archiveID)")
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: snapshot.path), let size = attributes[.size] as? NSNumber { uploadBytesByItem[item.id] = size.int64Value }
             saveUpload(id: archiveID, filename: item.key)
             uploadQueue[index].state = "Complete · Archive ID: \(archiveID)"
             return (true, false)
@@ -920,6 +983,18 @@ struct LegacyVaultDetailView: View {
             uploadQueue[index].state = detail
             return (false, submitted)
         }
+    }
+
+    @MainActor private func clearSelectedUnknown() async {
+        guard queueTask == nil, !clearingPendingQueue, !selectedQueueItems.isEmpty else { return }
+        clearingPendingQueue = true
+        defer { clearingPendingQueue = false }
+        do {
+            let count = try await getDurableTransferQueue().clearReviewedUnknown(profile: profile, accountID: accountID, region: region, vault: vault.vaultName, selected: selectedQueueItems)
+            selectedQueueItems.removeAll()
+            await refreshTransferHistory()
+            status = "Cleared \(count) local uncertain records. AWS uploads and archives were not changed."
+        } catch { status = "Could not clear uncertain records: \(error.localizedDescription)" }
     }
 
     @MainActor private func editQueue(clear: Bool) async {
@@ -943,7 +1018,7 @@ struct LegacyVaultDetailView: View {
         switch status {
         case .preparing(let multipart): return "\(multipart ? "Multipart" : "Single request") · calculating checksum…"
         case .singleRequest: return "Single request · uploading (part progress not available)"
-        case let .multipart(completed, total, partSize, connections):
+        case let .multipart(completed, total, partSize, connections, _):
             return "Multipart · \(completed) of \(total) parts complete · \(ByteCountFormatter.string(fromByteCount: partSize, countStyle: .binary)) per part · up to \(connections) parallel requests"
         case .completing: return "Multipart · all parts uploaded; confirming archive with AWS…"
         }

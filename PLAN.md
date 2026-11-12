@@ -1,10 +1,10 @@
-# GlacierDesk 0.2 status and roadmap
+# GlacierDesk 0.3 status and roadmap
 
 Copyright © 2026 WillisLabs.ai. Licensed under the Apache License, Version 2.0.
 
 ## Current checkpoint
 
-GlacierDesk 0.2 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, account-scoped local inventory indexing, verified downloads, and file and folder uploads with multipart support. Live-vault validation remains outstanding.
+GlacierDesk 0.3 is a native SwiftUI macOS development build for S3 objects, including Glacier storage classes. It uses an installed AWS CLI v2 with explicitly selected shared profiles, displays the STS identity, and supports bucket and prefix browsing, file and folder uploads, individual and batch downloads, Glacier restores, and an opt-in incomplete-upload lifecycle rule. It also lists legacy Glacier vaults by Region and supports asynchronous inventory and retrieval jobs, account-scoped local inventory indexing, verified downloads, and file and folder uploads with multipart support. Live-vault validation remains outstanding.
 
 Uploads have configurable multipart settings. Folder queue records persist across restarts and eligible files can be explicitly retried after reconnecting the original account; retries restart files rather than resuming uploaded parts. Unknown legacy upload outcomes require manual inspection. Downloads use a temporary destination before replacing the final file. Restore requests made by the app are stored locally and refreshed for the matching account and profile while the app runs; the current restore duration is three days.
 
@@ -27,6 +27,12 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 - [ ] Allow an operator to review and clear selected legacy upload records marked `outcomeUnknown` from the local transfer queue. Show the archive path and known multipart upload ID, explain that clearing the local record does not abort or delete anything in AWS, and require an explicit acknowledgement before removing the record. Preserve the existing restriction against automatic retry of uncertain uploads; offer guidance for inspecting and cleaning up an incomplete multipart upload in the correct account, Region, and vault. Include individual and bulk selection tests and verify that other queue entries are unaffected.
 
+### Implementation status
+
+- Implemented: opt-in inventory capture while the vault is open, persistent local snapshots, and protection against replacing a newer dated snapshot with an older one. Large-vault memory use, background capture, and broader browser scalability remain to be addressed.
+- Implemented: confirmed-part byte counts, average upload rates, snapshot/checksum timing, and an opt-in S3 upload test. The test attempts to delete its object and identified version and reports unconfirmed cleanup; separate network-capacity measurement, active-request counts, detailed AWS wait timing, and tuning recommendations remain open.
+- Implemented: graceful stop and separate immediate cancellation, plus reviewed clearing of selected uncertain local records. Dedicated concurrent stop/resume integration coverage and live AWS validation remain open.
+
 ## Next milestones
 
 1. Validate browse, upload, download, restore, and lifecycle flows against a dedicated AWS account and bucket, including permissions, SSO expiration, interruptions, and cost behavior.
@@ -35,7 +41,7 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 4. Improve restores with configurable duration, clearer expiration and status, recovery after interrupted submissions, and discovery or import of externally initiated requests.
 5. Complete accessibility and light/dark appearance review, security review, dependency and secret scanning, CI, signing, notarization, and distribution.
 
-Use a dedicated test account and bucket with narrowly scoped permissions and an explicit budget. Verify a complete upload → restore → download flow and file integrity before treating 0.1 as production-ready.
+Use a dedicated test account and bucket with narrowly scoped permissions and an explicit budget. Verify a complete upload → restore → download flow and file integrity before treating 0.3 as production-ready.
 
 ## Ownership and project
 

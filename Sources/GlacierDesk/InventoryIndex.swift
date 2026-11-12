@@ -131,6 +131,20 @@ public final class GlacierInventoryIndex: @unchecked Sendable {
                     archiveCount += 1
                 }
                 let inventoryDate = try produce(emit)
+                let previous = try Self.prepare(db, "SELECT inventory_date FROM inventory_snapshots WHERE profile=? AND account_id=? AND region=? AND vault=?")
+                defer { sqlite3_finalize(previous) }
+                Self.bind(scope.profile, at: 1, to: previous); Self.bind(scope.accountID, at: 2, to: previous); Self.bind(scope.region, at: 3, to: previous); Self.bind(scope.vault, at: 4, to: previous)
+                func inventoryTimestamp(_ value: String) -> Date? {
+                    let formatter = ISO8601DateFormatter()
+                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    if let date = formatter.date(from: value) { return date }
+                    formatter.formatOptions = [.withInternetDateTime]
+                    return formatter.date(from: value)
+                }
+                if sqlite3_step(previous) == SQLITE_ROW, let old = Self.text(previous, 0), let incoming = inventoryDate,
+                   let oldDate = inventoryTimestamp(old), let newDate = inventoryTimestamp(incoming), newDate < oldDate {
+                    throw InventoryIndexError.sqlite("The downloaded inventory is older than the cached snapshot; the newer snapshot was retained.")
+                }
                 let metadata = try Self.prepare(db, "INSERT INTO inventory_snapshots(profile,account_id,region,vault,inventory_date,imported_at,archive_count) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile,account_id,region,vault) DO UPDATE SET inventory_date=excluded.inventory_date, imported_at=excluded.imported_at, archive_count=excluded.archive_count")
                 defer { sqlite3_finalize(metadata) }
                 Self.bind(scope.profile, at: 1, to: metadata); Self.bind(scope.accountID, at: 2, to: metadata)

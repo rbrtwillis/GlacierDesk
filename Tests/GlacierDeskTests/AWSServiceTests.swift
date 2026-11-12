@@ -2,6 +2,13 @@ import Foundation
 import XCTest
 @testable import GlacierDesk
 
+private final class UploadStatusCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [LegacyUploadStatus] = []
+    func append(_ value: LegacyUploadStatus) { lock.lock(); defer { lock.unlock() }; values.append(value) }
+    func all() -> [LegacyUploadStatus] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
 final class AWSServiceTests: XCTestCase {
     func testLegacyDownloadVerifiesChecksumBeforeReplacingFile() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -49,8 +56,10 @@ final class AWSServiceTests: XCTestCase {
         try Data(repeating: 42, count: 1_048_576).write(to: file)
         var settings = UploadSettings(); settings.thresholdMiB = 1; settings.partSizeMiB = 5; settings.connections = 1
         let service = AWSService(profile: "test", executableURL: executable)
-        let id = try await service.uploadLegacyArchive(vault: "v", region: "us-west-2", file: file, description: "file", settings: settings)
+        let collector = UploadStatusCollector()
+        let id = try await service.uploadLegacyArchive(vault: "v", region: "us-west-2", file: file, description: "file", settings: settings, status: { collector.append($0) })
         XCTAssertEqual(id, "ok")
+        XCTAssertTrue(collector.all().contains { if case .multipart(completed: 1, total: 1, partSize: _, connections: 1, bytes: 1_048_576) = $0 { return true }; return false })
         try Data().write(to: root.appendingPathComponent("fail"))
         do {
             _ = try await service.uploadLegacyArchive(vault: "v", region: "us-west-2", file: file, description: "file", settings: settings)
@@ -58,5 +67,33 @@ final class AWSServiceTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("AWS confirmed the incomplete upload was aborted"), error.localizedDescription)
         }
+    }
+    func testSpeedTestCleanupUsesReturnedVersion() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("fake-aws")
+        let script = #"""
+        #!/bin/sh
+        operation=""
+        found=0
+        for arg in "$@"; do
+          case "$arg" in
+            head-object|delete-object) operation="$arg" ;;
+            --version-id=-ver_123) found=1 ;;
+          esac
+        done
+        case "$operation" in
+          head-object) printf '{"VersionId":"-ver_123"}' ;;
+          delete-object) [ "$found" = 1 ] || exit 1; printf '{}' ;;
+          *) exit 1 ;;
+        esac
+        """#
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let service = AWSService(profile: "test", executableURL: executable)
+        let metadata = try await service.headObject(bucket: "bucket", key: "test")
+        XCTAssertEqual(metadata.versionID, "-ver_123")
+        try await service.deleteTestObject(bucket: "bucket", key: "test", versionID: metadata.versionID)
     }
 }

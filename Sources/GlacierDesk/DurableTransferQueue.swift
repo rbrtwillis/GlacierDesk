@@ -285,6 +285,21 @@ actor DurableTransferQueue {
         return Int(sqlite3_changes(db))
     }
 
+    /// Removes only explicitly selected uncertain records in the matching vault.
+    func clearReviewedUnknown(profile: String, accountID: String, region: String, vault: String, selected: Set<UUID>) throws -> Int {
+        guard !selected.isEmpty else { return 0 }
+        let db = try requireDatabase()
+        let placeholders = Array(repeating: "?", count: selected.count).joined(separator: ",")
+        let sql = "DELETE FROM items WHERE state='outcomeUnknown' AND session_id IN (SELECT id FROM sessions WHERE kind='legacyArchiveUpload' AND profile=? AND account_id=? AND region=? AND vault=?) AND id IN (" + placeholders + ")"
+        try withStatement(db, sql) { statement in
+            Self.bind(profile, to: statement, at: 1); Self.bind(accountID, to: statement, at: 2)
+            Self.bind(region, to: statement, at: 3); Self.bind(vault, to: statement, at: 4)
+            for (index, id) in selected.sorted(by: { $0.uuidString < $1.uuidString }).enumerated() { Self.bind(id.uuidString, to: statement, at: Int32(index + 5)) }
+            try Self.step(statement, db: db)
+        }
+        return Int(sqlite3_changes(db))
+    }
+
     /// Atomically claim an eligible item so cancellation cannot be overwritten by the uploader.
     func claimLegacyItem(sessionID: UUID, itemID: UUID) throws -> Bool {
         let db = try requireDatabase()

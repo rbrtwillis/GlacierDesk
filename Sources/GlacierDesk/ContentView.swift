@@ -398,6 +398,7 @@ struct ContentView: View {
     @State private var folderPlan: FolderUploadPlan?
     @State private var showFolderReview = false
     @State private var showTransferQueue = false
+    @State private var showSpeedTest = false
     @State private var openQueueAfterReview = false
     @State private var queueRetryConfirmation = false
     @State private var folderScopes: [URL] = []
@@ -443,6 +444,11 @@ struct ContentView: View {
             if let plan = folderPlan { folderReview(plan) }
         }
         .sheet(isPresented: $showTransferQueue) { transferQueueWindow }
+        .sheet(isPresented: $showSpeedTest) {
+            if let profile = model.connectedProfile, let account = model.identity?.account, let bucket = model.selectedBucket {
+                UploadSpeedTestView(profile: profile, account: account, bucket: bucket.name, settings: speedTestSettings)
+            }
+        }
         .tint(GlacierTheme.accent)
         .task {
             model.loadRestores()
@@ -619,6 +625,8 @@ struct ContentView: View {
                     Text("Glacier Flexible").tag("GLACIER")
                     Text("Deep Archive").tag("DEEP_ARCHIVE")
                 }.frame(width: 175).help("Storage class for the next upload")
+                Button { showSpeedTest = true } label: { Image(systemName: "speedometer") }
+                    .help("Upload speed test").disabled(model.identity == nil || model.isBusy)
                 Button { chooseBucketUpload() } label: { Label("Upload", systemImage: "arrow.up.doc") }
                     .disabled(model.identity == nil || model.selectedBucket == nil || model.isBusy)
             }
@@ -827,6 +835,12 @@ struct ContentView: View {
                 List(model.activity, id: \.self) { item in Label(item, systemImage: "checkmark.circle").padding(.vertical, 5) }.listStyle(.plain)
             }
         }
+    }
+
+    private var speedTestSettings: UploadSettings {
+        var settings = UploadSettings()
+        settings.thresholdMiB = model.uploadThresholdMiB; settings.partSizeMiB = model.uploadPartSizeMiB; settings.connections = model.uploadConnections
+        return settings
     }
 
     private var transferQueueWindow: some View {

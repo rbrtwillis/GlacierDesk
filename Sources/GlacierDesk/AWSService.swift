@@ -4,7 +4,7 @@ import CryptoKit
 public enum LegacyUploadStatus: Sendable {
     case preparing(multipart: Bool)
     case singleRequest
-    case multipart(completed: Int, total: Int, partSize: Int64, connections: Int)
+    case multipart(completed: Int, total: Int, partSize: Int64, connections: Int, bytes: Int64)
     case completing
 }
 
@@ -133,7 +133,7 @@ public struct AWSService: Sendable {
         while partSize < required && partSize < 4096 * mib { partSize *= 2 }
         guard partSize >= required else { throw AWSServiceError.commandFailed("Archive or part size exceeds Glacier multipart limits (maximum 4 GiB per part and 10,000 parts).") }
         let partCount = Int((total + partSize - 1) / partSize)
-        status?(.multipart(completed: 0, total: partCount, partSize: partSize, connections: min(settings.connections, partCount)))
+        status?(.multipart(completed: 0, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: 0))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -145,8 +145,9 @@ public struct AWSService: Sendable {
             throw AWSServiceError.commandFailed("Could not confirm multipart initiation. An incomplete upload may exist without a known ID; inspect Glacier multipart uploads before retrying. \(error.localizedDescription)")
         }
         do {
-            try await withThrowingTaskGroup(of: Void.self) { group in
+            try await withThrowingTaskGroup(of: Int64.self) { group in
                 var next = 0, completed = 0
+                var completedBytes: Int64 = 0
                 func addPart(_ index: Int) {
                     group.addTask {
                         let offset = Int64(index) * partSize, length = min(partSize, total - offset)
@@ -155,12 +156,14 @@ public struct AWSService: Sendable {
                         try writeLegacyPart(source: file, destination: part, offset: offset, length: length)
                         let partHash = try glacierTreeHash(part)
                         _ = try await run(["glacier", "upload-multipart-part", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id=\(uploadId)", "--range", "bytes \(offset)-\(offset + length - 1)/*", "--checksum", partHash, "--body", part.path])
+                        return length
                     }
                 }
                 while next < min(partCount, settings.connections) { addPart(next); next += 1 }
-                while try await group.next() != nil {
+                while let length = try await group.next() {
+                    completedBytes += length
                     completed += 1; progress?(Double(completed) / Double(partCount))
-                    status?(.multipart(completed: completed, total: partCount, partSize: partSize, connections: min(settings.connections, partCount)))
+                    status?(.multipart(completed: completed, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: completedBytes))
                     if next < partCount { addPart(next); next += 1 }
                 }
             }
@@ -235,6 +238,13 @@ public struct AWSService: Sendable {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         var args = ["s3api", "put-bucket-lifecycle-configuration", "--bucket", bucket, "--expected-bucket-owner", account, "--lifecycle-configuration", "file://\(file.path)"]
         if let minimum = original.transitionMinimum { args += ["--transition-default-minimum-object-size", minimum] }
+        _ = try await run(args)
+    }
+
+    /// Delete the specifically identified test object version when available.
+    public func deleteTestObject(bucket: String, key: String, versionID: String?) async throws {
+        var args = ["s3api", "delete-object", "--bucket", bucket, "--key=\(key)"]
+        if let versionID { args.append("--version-id=\(versionID)") }
         _ = try await run(args)
     }
 
@@ -537,11 +547,12 @@ public struct AWSObjectMetadata: Decodable, Sendable {
     public let contentLength: Int64?
     public let lastModified: Date?
     public let eTag: String?
+    public let versionID: String?
     public let storageClass: String?
     /// S3 returns `ongoing-request="false", expiry-date="..."` when restored.
     public let restore: String?
     enum CodingKeys: String, CodingKey {
-        case contentLength = "ContentLength", lastModified = "LastModified", eTag = "ETag"
+        case contentLength = "ContentLength", lastModified = "LastModified", eTag = "ETag", versionID = "VersionId"
         case storageClass = "StorageClass", restore = "Restore"
     }
 }

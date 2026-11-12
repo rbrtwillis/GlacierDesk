@@ -228,4 +228,18 @@ final class DurableTransferQueueTests: XCTestCase {
         let sessions = try await queue.allSessions()
         XCTAssertEqual(sessions.first?.items.map(\.id), [unknown.id])
     }
+    func testReviewedUnknownClearIsSelectedAndScoped() async throws {
+        let queue = try DurableTransferQueue(fileURL: temporaryQueueURL())
+        let unknown = DurableTransferItem(sourcePath: "a", sourceBookmark: Data(), target: "a", state: .outcomeUnknown)
+        let kept = DurableTransferItem(sourcePath: "b", sourceBookmark: Data(), target: "b", state: .outcomeUnknown)
+        let pending = DurableTransferItem(sourcePath: "c", sourceBookmark: Data(), target: "c")
+        let session = DurableTransferSession(kind: .legacyArchiveUpload, accountID: "a", profile: "p", destination: "v", vault: "v", region: "r", items: [unknown, kept, pending])
+        try await queue.add(session)
+        let empty = try await queue.clearReviewedUnknown(profile: "p", accountID: "a", region: "r", vault: "v", selected: [])
+        let wrong = try await queue.clearReviewedUnknown(profile: "p", accountID: "other", region: "r", vault: "v", selected: [unknown.id])
+        let cleared = try await queue.clearReviewedUnknown(profile: "p", accountID: "a", region: "r", vault: "v", selected: [unknown.id, pending.id])
+        XCTAssertEqual(empty, 0); XCTAssertEqual(wrong, 0); XCTAssertEqual(cleared, 1)
+        let sessions = try await queue.allSessions()
+        XCTAssertEqual(Set(sessions[0].items.map(\.id)), Set([kept.id, pending.id]))
+    }
 }

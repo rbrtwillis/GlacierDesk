@@ -1,4 +1,4 @@
-# GlacierDesk 0.2 visual identity
+# GlacierDesk 0.3 visual identity
 
 Copyright © 2026 WillisLabs.ai.
 
