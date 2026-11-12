@@ -33,6 +33,10 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 - Implemented: active file and part-task counts, confirmed-part byte counts, average rates, snapshot/checksum and summed AWS request timings, and an opt-in S3 upload test with attempted version-aware cleanup. An opt-in macOS networkQuality test measures upload capacity to its configured Internet endpoint; it does not guarantee S3 performance. The README provides conditional tuning guidance; live testing and automatic bottleneck identification remain open.
 - Implemented: graceful stop and separate immediate cancellation, plus reviewed clearing of selected uncertain local records. Simulated concurrent stop/resume and durable-queue restart coverage has been added; live AWS validation remains open.
 
+## Later S3 interface work
+
+- [ ] Revisit the sidebar bucket list when improving the S3 interface. Consider moving bucket navigation into the S3 Browse experience so it does not take space or appear to be loading while working with legacy vaults. Fix loading, empty, error, and collapsed states; keep long bucket names usable and retain access to all buckets. Verify the behavior when switching between S3 and legacy vaults, reconnecting, and resizing the window.
+
 ## Next milestones
 
 1. Validate browse, upload, download, restore, and lifecycle flows against a dedicated AWS account and bucket, including permissions, SSO expiration, interruptions, and cost behavior.
