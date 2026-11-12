@@ -30,6 +30,8 @@ struct LegacyVaultDetailView: View {
     @State private var notifiedJobStates: [String: String] = [:]
     @State private var jobRefreshError: String?
     @State private var inventoryDate: String?
+    @State private var navigateToInventory = UUID()
+    @State private var vaultSection = "Browse"
     @State private var inventoryFolders: LegacyInventoryFolders?
     @State private var folderOffset = 0
     @State private var folderCount = 0
@@ -87,6 +89,10 @@ struct LegacyVaultDetailView: View {
     @State private var showTransferHistory = false
     @State private var clearingPendingQueue = false
     @State private var selectedQueueItems = Set<UUID>()
+    @State private var deletionSelection = LegacyDeletionSelection()
+    @State private var deletionPlan: [IndexedGlacierArchive] = []
+    @State private var showDeletionReview = false
+    @State private var deletionConfirmation = ""
     @State private var currentQueueIDs: [UUID: UUID] = [:]
     @State private var openQueueAfterReview = false
     @State private var reviewedLegacyRetrySession: DurableTransferSession?
@@ -123,93 +129,58 @@ struct LegacyVaultDetailView: View {
     }
 
     var body: some View {
+        ScrollViewReader { proxy in
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Button("← All vaults", action: back).disabled(busy)
-                Text(vault.vaultName).font(.title2.weight(.semibold)).textSelection(.enabled)
-                Text("\(region) · Legacy Glacier vault").foregroundStyle(.secondary)
-                Text("Inventory and archive retrieval are asynchronous and may take hours. Job output is available for a limited time. Requests and downloads may incur AWS charges.")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Button("Request inventory…") { confirmInventory = true }.disabled(busy)
-                    Button("Refresh jobs") { Task { await refresh(); await captureCompletedInventoryIfEnabled() } }.disabled(busy)
-                    Button("Upload files or folders…") { chooseLegacyUpload() }.disabled(busy)
+                HStack(alignment: .top, spacing: 16) {
+                    Button(action: back) { Label("All vaults", systemImage: "chevron.left") }.disabled(busy)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(vault.vaultName).font(.title2.weight(.semibold)).textSelection(.enabled)
+                        Label("\(region) · Legacy Glacier vault", systemImage: "archivebox").font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer()
                     if busy { ProgressView().controlSize(.small) }
+                }
+                HStack {
+                    Button { chooseLegacyUpload() } label: { Label("Upload…", systemImage: "arrow.up.doc") }.disabled(busy)
+                    Button { showTransferHistory = true; Task { await refreshTransferHistory() } } label: { Label("Transfer queue", systemImage: "list.bullet.rectangle") }
+                    Button { confirmInventory = true } label: { Label("Request inventory…", systemImage: "doc.text.magnifyingglass") }.disabled(busy)
+                    Button { Task { await refresh(); await captureCompletedInventoryIfEnabled() } } label: { Label("Refresh jobs", systemImage: "arrow.clockwise") }.disabled(busy)
                 }
                 Text(dropTargeted ? "Drop to prepare upload" : "Drag files or folders from Finder here to prepare an upload queue.")
                     .font(.caption).foregroundStyle(GlacierTheme.accent)
-                if !uploadQueue.isEmpty {
-                    ProgressView(value: queueProgress)
-                    if queueTask != nil { Button("Stop after active files") { stopRequested = true } }
-                    ForEach(uploadQueue) { entry in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(entry.item.key).font(.caption.monospaced()).textSelection(.enabled)
-                            Text(entry.state).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                        }
+                if queueTask != nil {
+                    HStack {
+                        ProgressView(value: queueProgress).frame(maxWidth: 240)
+                        Text("Uploads in progress").font(.caption).foregroundStyle(.secondary)
+                        Button("View queue") { showTransferHistory = true }
                     }
                 }
-                Button("Transfer queue…") { showTransferHistory = true; Task { await refreshTransferHistory() } }
-                if let status { Text(status).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+                if let status {
+                    Label(status, systemImage: "info.circle").font(.callout).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true).padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                }
+                Picker("Vault section", selection: $vaultSection) {
+                    Text("Browse").tag("Browse")
+                    Text("Jobs").tag("Jobs")
+                    Text("Uploads").tag("Uploads")
+                    Text("Retrieve").tag("Retrieve")
+                }.pickerStyle(.segmented).frame(maxWidth: 560).padding(.vertical, 6)
                 Divider()
-                Text("Jobs").font(.headline)
-                Toggle("Automatically cache inventory jobs for vaults I open", isOn: $autoCaptureInventory)
-                    .toggleStyle(.checkbox).font(.caption)
-                    .onChange(of: autoCaptureInventory) { enabled in if enabled { Task { await captureCompletedInventoryIfEnabled() } } }
-                Text("Automatic capture checks registered vaults while GlacierDesk is open and connected to the same account. Downloads may incur AWS charges. Cached snapshots remain on this Mac.").font(.caption).foregroundStyle(.secondary)
-                if let message = captureCoordinator.messages[monitoredVault.key] { Text(message).font(.caption).foregroundStyle(.secondary) }
-                Toggle("Notify me when a Glacier job finishes", isOn: $jobNotificationsEnabled)
-                    .toggleStyle(.checkbox)
-                    .font(.caption)
-                if let jobRefreshError { Text("Automatic job refresh failed: \(jobRefreshError)").font(.caption).foregroundStyle(.secondary) }
-                if jobs.isEmpty { Text("No recent jobs found. Refresh to check AWS.").foregroundStyle(.secondary) }
-                ForEach(jobs) { job in
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("\(job.action ?? "Job") · \(job.statusCode ?? "Unknown")").font(.subheadline.weight(.semibold))
-                        if job.statusCode == "Succeeded" && (job.action == "ArchiveRetrieval" || job.action == "InventoryRetrieval") {
-                            Label("AWS keeps job output for at least 24 hours; opened inventories remain cached on this Mac", systemImage: "clock")
-                                .font(.caption).foregroundStyle(.orange)
-                        } else if job.statusCode == "InProgress" {
-                            Label("AWS is processing this job; jobs refresh automatically while in progress", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Text("Job ID: \(job.jobId)").font(.caption.monospaced()).textSelection(.enabled)
-                        if let id = job.archiveId { Text("Archive ID: \(id)").font(.caption.monospaced()).textSelection(.enabled) }
-                        if job.statusCode == "Succeeded" && job.action == "InventoryRetrieval" {
-                            Button("Open inventory") { Task { await openInventory(job) } }.disabled(busy)
-                        }
-                        if job.statusCode == "Succeeded" && job.action == "ArchiveRetrieval" {
-                            Button("Download archive…") { chooseDestination(job) }.disabled(busy)
-                        }
-                    }.padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                }
-                Divider()
-                let saved = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }
-                if !saved.isEmpty {
-                    Text("Archives uploaded from this Mac").font(.headline)
-                    ForEach(saved) { item in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(item.filename).font(.subheadline.weight(.medium))
-                            Text(item.id).font(.caption.monospaced()).textSelection(.enabled)
-                            Button("Select for retrieval") { archiveID = item.id }.disabled(busy)
-                        }.padding(.vertical, 4)
-                    }
-                    Divider()
-                }
-                let olderUploads = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == nil && $0.region == region && $0.vault == vault.vaultName }
-                if !olderUploads.isEmpty {
-                    DisclosureGroup("Older uploads with unverified account (\(olderUploads.count))") {
-                        Text("These records predate account tracking. Verify the AWS account before using an archive ID.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        ForEach(olderUploads) { item in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.filename).font(.caption)
-                                Text(item.id).font(.caption.monospaced()).textSelection(.enabled)
-                            }.padding(.vertical, 3)
-                        }
-                    }
-                    Divider()
-                }
-                Text("Browse inventory").font(.headline)
+                if vaultSection == "Browse" {
+                Text("Browse inventory").font(.headline).id("inventory-browser")
+                if inventoryDate == nil {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("No cached inventory", systemImage: "archivebox").font(.title3.weight(.medium))
+                        Text("Open a completed inventory job to browse the vault, or request a new inventory. Jobs can take hours and AWS charges may apply.")
+                            .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        if let inventoryIndexError { Text(inventoryIndexError).font(.caption).foregroundStyle(.orange) }
+                        Button("View jobs") { vaultSection = "Jobs" }
+                    }.padding(20).frame(maxWidth: .infinity, minHeight: 160, alignment: .leading)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                } else {
                 if let inventoryDate { Text("Cached inventory date: \(inventoryDate) · Saved on this Mac until replaced or removed").font(.caption).foregroundStyle(.secondary) }
                 if inventoryDate != nil {
                     Button("Compare inventory with S3…") { showMigration = true; migrationAssessment = nil }
@@ -246,12 +217,25 @@ struct LegacyVaultDetailView: View {
                 .onChange(of: inventorySortChoice) { _ in inventoryOffset = 0; Task { await loadInventoryPage() } }
                 .onChange(of: inventoryAscending) { _ in inventoryOffset = 0; Task { await loadInventoryPage() } }
                 if let inventoryIndexError { Text("Local inventory index is unavailable. Reload a completed inventory before browsing or comparing: \(inventoryIndexError)").font(.caption).foregroundStyle(.orange) }
+                HStack {
+                    Button("Review deletion…") { Task { await prepareArchiveDeletion() } }
+                        .disabled(busy || (deletionSelection.archiveIDs.isEmpty && deletionSelection.folders.isEmpty))
+                    if !deletionSelection.archiveIDs.isEmpty || !deletionSelection.folders.isEmpty {
+                        Text("\(deletionSelection.folders.count) folders · \(deletionSelection.archiveIDs.count) files selected").font(.caption).foregroundStyle(.secondary)
+                        Button("Clear selection") { deletionSelection = LegacyDeletionSelection() }
+                    }
+                }
                 ForEach(visibleInventoryFolders, id: \.self) { folder in
+                    let fullPath = currentInventoryFolder.isEmpty ? folder : currentInventoryFolder + "/" + folder
+                    HStack {
+                    Toggle("Select folder \(fullPath)", isOn: Binding(get: { deletionSelection.folders.contains(fullPath) }, set: { selected in if selected { deletionSelection.folders.insert(fullPath) } else { deletionSelection.folders.remove(fullPath) } }))
+                        .labelsHidden().toggleStyle(.checkbox).disabled(busy)
                     Button {
                         currentInventoryFolder = currentInventoryFolder.isEmpty ? folder : currentInventoryFolder + "/" + folder
                         search = ""; inventoryOffset = 0; folderOffset = 0; Task { await loadInventoryPage() }
                     } label: { Label(folder, systemImage: "folder.fill").frame(maxWidth: .infinity, alignment: .leading) }
-                        .buttonStyle(.plain).padding(.vertical, 5)
+                        .buttonStyle(.plain)
+                    }.padding(.vertical, 5)
                 }
                 if folderCount > inventoryPageSize {
                     HStack {
@@ -261,6 +245,9 @@ struct LegacyVaultDetailView: View {
                     }
                 }
                 ForEach(visibleArchives) { archive in
+                    HStack(alignment: .top) {
+                    Toggle("Select archive \(LegacyInventoryFolders.filename(archive))", isOn: Binding(get: { deletionSelection.archiveIDs.contains(archive.archiveID) }, set: { selected in if selected { deletionSelection.archiveIDs.insert(archive.archiveID) } else { deletionSelection.archiveIDs.remove(archive.archiveID) } }))
+                        .labelsHidden().toggleStyle(.checkbox).disabled(busy)
                     VStack(alignment: .leading, spacing: 4) {
                         Label(LegacyInventoryFolders.filename(archive), systemImage: "doc").font(.subheadline.weight(.medium)).textSelection(.enabled)
                         if locallyAddedArchiveIDs.contains(archive.archiveID) { Text("Uploaded from this Mac · not yet in AWS inventory snapshot").font(.caption).foregroundStyle(.secondary) }
@@ -269,7 +256,8 @@ struct LegacyVaultDetailView: View {
                             if let description = archive.description { Text("Description: \(description)").font(.caption).textSelection(.enabled) }
                         }
                         Text("\(archive.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "Unknown size") · \(archive.creationDate ?? "Unknown date")").font(.caption).foregroundStyle(.secondary)
-                        Button("Select for retrieval") { archiveID = archive.archiveID }.disabled(busy)
+                        Button("Select for retrieval") { archiveID = archive.archiveID; vaultSection = "Retrieve" }.disabled(busy)
+                    }
                     }.padding(.vertical, 5)
                 }
                 if let page = inventoryPage, page.totalCount > inventoryPageSize {
@@ -281,15 +269,92 @@ struct LegacyVaultDetailView: View {
                             .disabled(busy || inventoryOffset + page.archives.count >= page.totalCount)
                     }
                 }
-                Divider()
+                }
+                }
+                if vaultSection == "Jobs" {
+                HStack {
+                    Text("Jobs").font(.headline)
+                    Spacer()
+                    Text("Inventory and retrieval jobs can take hours.").font(.caption).foregroundStyle(.secondary)
+                }
+                Toggle("Automatically cache inventory jobs for vaults I open", isOn: $autoCaptureInventory)
+                    .toggleStyle(.checkbox).font(.caption)
+                    .onChange(of: autoCaptureInventory) { enabled in if enabled { Task { await captureCompletedInventoryIfEnabled() } } }
+                Text("Automatic capture checks registered vaults while GlacierDesk is open and connected to the same account. Downloads may incur AWS charges. Cached snapshots remain on this Mac.").font(.caption).foregroundStyle(.secondary)
+                if let message = captureCoordinator.messages[monitoredVault.key] { Text(message).font(.caption).foregroundStyle(.secondary) }
+                Toggle("Notify me when a Glacier job finishes", isOn: $jobNotificationsEnabled)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                if let jobRefreshError { Text("Automatic job refresh failed: \(jobRefreshError)").font(.caption).foregroundStyle(.secondary) }
+                if jobs.isEmpty { Text("No recent jobs found. Refresh to check AWS.").foregroundStyle(.secondary) }
+                ForEach(jobs) { job in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("\(job.action ?? "Job") · \(job.statusCode ?? "Unknown")").font(.subheadline.weight(.semibold))
+                        Text("Created: \(Self.jobDate(job.creationDate))").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        if job.statusCode == "Succeeded" && (job.action == "ArchiveRetrieval" || job.action == "InventoryRetrieval") {
+                            Label("AWS keeps job output for at least 24 hours; opened inventories remain cached on this Mac", systemImage: "clock")
+                                .font(.caption).foregroundStyle(.orange)
+                        } else if job.statusCode == "InProgress" {
+                            Label("AWS is processing this job; jobs refresh automatically while in progress", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text("Job ID: \(job.jobId)").font(.caption.monospaced()).textSelection(.enabled)
+                        if let id = job.archiveId { Text("Archive ID: \(id)").font(.caption.monospaced()).textSelection(.enabled) }
+                        if job.statusCode == "Succeeded" && job.action == "InventoryRetrieval" {
+                            Button("Open inventory") { Task { await openInventory(job) } }.disabled(busy)
+                        }
+                        if job.statusCode == "Succeeded" && job.action == "ArchiveRetrieval" {
+                            Button("Download archive…") { chooseDestination(job) }.disabled(busy)
+                        }
+                    }.padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                }
+                }
+                if vaultSection == "Uploads" {
+                Text("Upload history").font(.headline)
+                Text("Archive IDs saved on this Mac for this vault.").font(.caption).foregroundStyle(.secondary)
+                let saved = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }
+                if !saved.isEmpty {
+                    DisclosureGroup("Archives uploaded from this Mac (\(saved.count))") {
+                        ForEach(saved) { item in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.filename).font(.subheadline.weight(.medium))
+                                Text(item.id).font(.caption.monospaced()).textSelection(.enabled)
+                                Button("Select for retrieval") { archiveID = item.id; vaultSection = "Retrieve" }.disabled(busy)
+                            }.padding(.vertical, 4)
+                        }
+                    }
+                    Divider()
+                }
+                let olderUploads = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == nil && $0.region == region && $0.vault == vault.vaultName }
+                if !olderUploads.isEmpty {
+                    DisclosureGroup("Older uploads with unverified account (\(olderUploads.count))") {
+                        Text("These records predate account tracking. Verify the AWS account before using an archive ID.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(olderUploads) { item in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.filename).font(.caption)
+                                Text(item.id).font(.caption.monospaced()).textSelection(.enabled)
+                            }.padding(.vertical, 3)
+                        }
+                    }
+                    Divider()
+                }
+                }
+                if vaultSection == "Retrieve" {
                 Text("Retrieve an archive").font(.headline)
+                Text("Enter an archive ID or select an archive from Browse. Retrieval may take hours and incur AWS charges.").font(.caption).foregroundStyle(.secondary)
                 TextField("Archive ID", text: $archiveID).textFieldStyle(.roundedBorder)
                 HStack {
                     Picker("Retrieval tier", selection: $tier) { Text("Standard").tag("Standard"); Text("Bulk").tag("Bulk"); Text("Expedited").tag("Expedited") }.frame(width: 260)
                     Button("Request retrieval…") { confirmRetrieval = true }.disabled(busy || archiveID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 Link("AWS Glacier pricing", destination: URL(string: "https://aws.amazon.com/s3/pricing/")!)
+                }
             }.padding(20).frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .onChange(of: navigateToInventory) { _ in
+            withAnimation { proxy.scrollTo("inventory-browser", anchor: .top) }
+        }
         }
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: acceptDrop)
         .onReceive(NotificationCenter.default.publisher(for: .legacyInventoryCaptured)) { notification in
@@ -302,6 +367,30 @@ struct LegacyVaultDetailView: View {
             if openQueueAfterReview { openQueueAfterReview = false; showTransferHistory = true }
         }) {
             if let plan = folderPlan { folderReview(plan) }
+        }
+        .sheet(isPresented: $showDeletionReview) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Permanently delete archives?").font(.title2.weight(.semibold))
+                Text("Account \(accountID) · \(region) · Vault \(vault.vaultName)").textSelection(.enabled)
+                Text("\(deletionPlan.count) known archives will be deleted, including all nested archives found under selected folders. This cannot be undone. AWS early-deletion charges may apply; in-progress retrievals may fail.")
+                    .foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                Text("This list is based on the cached inventory and uploads recorded on this Mac. AWS inventory may be stale, so archives absent from the snapshot cannot be included. Verify the vault after deletion.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                List(deletionPlan) { archive in
+                    VStack(alignment: .leading) {
+                        Text(LegacyInventoryFolders.path(for: archive.description) ?? "Unnamed archive").textSelection(.enabled)
+                        Text(archive.archiveID).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                TextField("Type DELETE to confirm", text: $deletionConfirmation).textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Cancel") { showDeletionReview = false; deletionConfirmation = "" }
+                    Spacer()
+                    Button("Permanently delete \(deletionPlan.count) archives", role: .destructive) {
+                        showDeletionReview = false; deletionConfirmation = ""; Task { await deleteReviewedArchives() }
+                    }.disabled(deletionConfirmation != "DELETE" || deletionPlan.isEmpty || busy)
+                }
+            }.padding(20).frame(minWidth: 680, minHeight: 520)
         }
         .sheet(isPresented: $showMigration) {
             if let assessment = migrationAssessment {
@@ -573,7 +662,8 @@ struct LegacyVaultDetailView: View {
             inventoryIndexError = nil
             inventoryOffset = 0
             await loadInventoryPage()
-            status = "Inventory loaded and indexed."
+            if let inventoryIndexError { status = "Inventory was indexed, but browsing failed: \(inventoryIndexError)" }
+            else { status = "Inventory loaded and indexed."; vaultSection = "Browse"; navigateToInventory = UUID() }
         } catch { status = error.localizedDescription }
     }
 
@@ -598,8 +688,9 @@ struct LegacyVaultDetailView: View {
             let locallySaved = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }.map { IndexedGlacierArchive(archiveID: $0.id, description: String($0.filename.unicodeScalars.map { (32...126).contains($0.value) ? Character($0) : "_" }.prefix(1024))) }
             inventoryLoadTask?.cancel()
             let task = Task.detached(priority: .utility) {
-                try index.browseFolder(scope: scope, folder: folder, search: query, offset: offset, folderOffset: folderPage,
-                    pageSize: size, sort: sort, ascending: ascending, locallySaved: locallySaved)
+                let deleted = try index.deletedArchiveIDs(scope: scope)
+                return try index.browseFolder(scope: scope, folder: folder, search: query, offset: offset, folderOffset: folderPage,
+                    pageSize: size, sort: sort, ascending: ascending, locallySaved: locallySaved.filter { !deleted.contains($0.archiveID) })
             }
             inventoryLoadTask = task
             let result = try await task.value
@@ -611,6 +702,51 @@ struct LegacyVaultDetailView: View {
             inventoryIndexError = nil
         } catch { guard inventoryQueryToken == token else { return }; inventoryIndexError = error.localizedDescription; inventoryPage = nil }
     }
+    @MainActor private func prepareArchiveDeletion() async {
+        guard !busy, let index = inventoryIndex else { return }
+        busy = true; defer { busy = false }
+        let selection = deletionSelection, scope = inventoryScope
+        let saved = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }
+            .map { IndexedGlacierArchive(archiveID: $0.id, description: String($0.filename.unicodeScalars.map { (32...126).contains($0.value) ? Character($0) : "_" }.prefix(1024))) }
+        do {
+            deletionPlan = try await Task.detached(priority: .userInitiated) {
+                var selected: [String: IndexedGlacierArchive] = [:]
+                let deleted = try index.deletedArchiveIDs(scope: scope)
+                try index.forEachArchive(scope: scope) { archive in if selection.includes(archive) { selected[archive.archiveID] = archive } }
+                for archive in saved where !deleted.contains(archive.archiveID) && selection.includes(archive) { if selected[archive.archiveID] == nil { selected[archive.archiveID] = archive } }
+                return selected.values.sorted { ($0.description ?? $0.archiveID).localizedStandardCompare($1.description ?? $1.archiveID) == .orderedAscending }
+            }.value
+            guard !deletionPlan.isEmpty else { status = "No known archives matched the selection."; return }
+            deletionConfirmation = ""; showDeletionReview = true
+        } catch { status = "Could not prepare deletion review: \(error.localizedDescription)" }
+    }
+
+    @MainActor private func deleteReviewedArchives() async {
+        guard !busy, let index = inventoryIndex, !deletionPlan.isEmpty else { return }
+        busy = true; defer { busy = false }
+        let scope = inventoryScope, plan = deletionPlan
+        var deleted = 0
+        do {
+            let identity = try await service.identity()
+            guard identity.account == accountID else { throw AWSServiceError.commandFailed("The profile is connected to a different AWS account. No archives were deleted.") }
+            for archive in plan {
+                status = "Deleting archive \(deleted + 1) of \(plan.count)…"
+                try await service.deleteLegacyArchive(account: accountID, vault: vault.vaultName, region: region, archiveID: archive.archiveID)
+                try await Task.detached(priority: .utility) { try index.recordDeletedArchive(scope: scope, archiveID: archive.archiveID) }.value
+                if var saved = try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData) {
+                    saved.removeAll { $0.id == archive.archiveID && $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }
+                    if let data = try? JSONEncoder().encode(saved) { uploadedData = data }
+                }
+                deleted += 1
+            }
+            deletionSelection = LegacyDeletionSelection(); deletionPlan = []
+            status = "Deleted \(deleted) archives. AWS inventory snapshots may remain stale."
+        } catch {
+            status = "Stopped after \(deleted) confirmed deletions. The current request or local update may be uncertain: \(error.localizedDescription). Inspect the vault before retrying."
+        }
+        inventoryFolders = nil; await loadInventoryPage()
+    }
+
     @MainActor private func chooseDestination(_ job: LegacyJob) {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "glacier-archive"; panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
@@ -1021,6 +1157,16 @@ struct LegacyVaultDetailView: View {
             }
             status = clear ? "Cleared \(count) finished items; uncertain uploads remain in history." : "Cancelled \(count) pending items. Active transfers continue."
         } catch { status = "Could not update the queue: \(error.localizedDescription)" }
+    }
+
+    private static func jobDate(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "Unknown" }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let fractional = formatter.date(from: value)
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let date = fractional ?? formatter.date(from: value) else { return value }
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 
     private static func describeUpload(_ status: LegacyUploadStatus) -> String {

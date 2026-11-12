@@ -86,6 +86,10 @@ public final class GlacierInventoryIndex: @unchecked Sendable {
                 CREATE INDEX IF NOT EXISTS archives_scope_date ON archives(profile, account_id, region, vault, creation_date);
                 CREATE INDEX IF NOT EXISTS archives_scope_size ON archives(profile, account_id, region, vault, size);
                 CREATE INDEX IF NOT EXISTS archives_scope_id ON archives(profile, account_id, region, vault, archive_id);
+                CREATE TABLE IF NOT EXISTS deleted_archives (
+                  profile TEXT NOT NULL, account_id TEXT NOT NULL, region TEXT NOT NULL, vault TEXT NOT NULL, archive_id TEXT NOT NULL,
+                  PRIMARY KEY(profile, account_id, region, vault, archive_id)
+                );
                 CREATE TABLE IF NOT EXISTS inventory_snapshots (
                   profile TEXT NOT NULL, account_id TEXT NOT NULL, region TEXT NOT NULL, vault TEXT NOT NULL,
                   inventory_date TEXT, imported_at TEXT NOT NULL, archive_count INTEGER NOT NULL,
@@ -117,7 +121,7 @@ public final class GlacierInventoryIndex: @unchecked Sendable {
                 defer { sqlite3_finalize(delete) }
                 Self.bind(scope.profile, at: 1, to: delete); Self.bind(scope.accountID, at: 2, to: delete); Self.bind(scope.region, at: 3, to: delete); Self.bind(scope.vault, at: 4, to: delete)
                 try Self.stepDone(db, delete)
-                let insert = try Self.prepare(db, "INSERT INTO archives(profile,account_id,region,vault,archive_id,description,size,creation_date) VALUES(?,?,?,?,?,?,?,?)")
+                let insert = try Self.prepare(db, "INSERT INTO archives(profile,account_id,region,vault,archive_id,description,size,creation_date) SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM deleted_archives WHERE profile=? AND account_id=? AND region=? AND vault=? AND archive_id=?)")
                 defer { sqlite3_finalize(insert) }
                 var archiveCount = 0
                 func emit(_ archive: IndexedGlacierArchive) throws {
@@ -127,8 +131,9 @@ public final class GlacierInventoryIndex: @unchecked Sendable {
                     Self.bind(archive.description, at: 6, to: insert)
                     if let size = archive.size { sqlite3_bind_int64(insert, 7, size) } else { sqlite3_bind_null(insert, 7) }
                     Self.bind(archive.creationDate, at: 8, to: insert)
+                    Self.bind(scope.profile, at: 9, to: insert); Self.bind(scope.accountID, at: 10, to: insert); Self.bind(scope.region, at: 11, to: insert); Self.bind(scope.vault, at: 12, to: insert); Self.bind(archive.archiveID, at: 13, to: insert)
                     try Self.stepDone(db, insert)
-                    archiveCount += 1
+                    archiveCount += Int(sqlite3_changes(db))
                 }
                 let inventoryDate = try produce(emit)
                 let previous = try Self.prepare(db, "SELECT inventory_date FROM inventory_snapshots WHERE profile=? AND account_id=? AND region=? AND vault=?")
@@ -217,6 +222,43 @@ public final class GlacierInventoryIndex: @unchecked Sendable {
                 try visit(IndexedGlacierArchive(archiveID: Self.text(stmt, 0) ?? "", description: Self.text(stmt, 1),
                     size: sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 2), creationDate: Self.text(stmt, 3)))
             }
+        }
+    }
+
+    func deletedArchiveIDs(scope: GlacierInventoryScope) throws -> Set<String> {
+        try withDatabase { db in
+            let stmt = try Self.prepare(db, "SELECT archive_id FROM deleted_archives WHERE profile=? AND account_id=? AND region=? AND vault=?")
+            defer { sqlite3_finalize(stmt) }
+            Self.bind(scope.profile, at: 1, to: stmt); Self.bind(scope.accountID, at: 2, to: stmt); Self.bind(scope.region, at: 3, to: stmt); Self.bind(scope.vault, at: 4, to: stmt)
+            var ids = Set<String>()
+            while true {
+                let result = sqlite3_step(stmt)
+                if result == SQLITE_DONE { return ids }
+                guard result == SQLITE_ROW else { throw Self.failure(db) }
+                if let id = Self.text(stmt, 0) { ids.insert(id) }
+            }
+        }
+    }
+
+    /// Persist a confirmed AWS deletion so older AWS inventory snapshots cannot reintroduce it.
+    func recordDeletedArchive(scope: GlacierInventoryScope, archiveID: String) throws {
+        try withDatabase { db in
+            try Self.exec(db, "BEGIN IMMEDIATE")
+            do {
+                let marker = try Self.prepare(db, "INSERT OR IGNORE INTO deleted_archives(profile,account_id,region,vault,archive_id) VALUES(?,?,?,?,?)")
+                defer { sqlite3_finalize(marker) }
+                Self.bind(scope.profile, at: 1, to: marker); Self.bind(scope.accountID, at: 2, to: marker); Self.bind(scope.region, at: 3, to: marker); Self.bind(scope.vault, at: 4, to: marker); Self.bind(archiveID, at: 5, to: marker)
+                try Self.stepDone(db, marker)
+                let delete = try Self.prepare(db, "DELETE FROM archives WHERE profile=? AND account_id=? AND region=? AND vault=? AND archive_id=?")
+                defer { sqlite3_finalize(delete) }
+                Self.bind(scope.profile, at: 1, to: delete); Self.bind(scope.accountID, at: 2, to: delete); Self.bind(scope.region, at: 3, to: delete); Self.bind(scope.vault, at: 4, to: delete); Self.bind(archiveID, at: 5, to: delete)
+                try Self.stepDone(db, delete)
+                let removed = sqlite3_changes(db)
+                let update = try Self.prepare(db, "UPDATE inventory_snapshots SET archive_count=MAX(0,archive_count-?) WHERE profile=? AND account_id=? AND region=? AND vault=?")
+                defer { sqlite3_finalize(update) }
+                sqlite3_bind_int(update, 1, removed); Self.bind(scope.profile, at: 2, to: update); Self.bind(scope.accountID, at: 3, to: update); Self.bind(scope.region, at: 4, to: update); Self.bind(scope.vault, at: 5, to: update)
+                try Self.stepDone(db, update); try Self.exec(db, "COMMIT")
+            } catch { try? Self.exec(db, "ROLLBACK"); throw error }
         }
     }
 

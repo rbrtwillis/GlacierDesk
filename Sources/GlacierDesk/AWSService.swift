@@ -103,6 +103,11 @@ public struct AWSService: Sendable {
         else { try FileManager.default.moveItem(at: temporary, to: destination) }
     }
 
+    /// Permanently delete one legacy archive from the explicitly identified account and vault.
+    public func deleteLegacyArchive(account: String, vault: String, region: String, archiveID: String) async throws {
+        _ = try await run(["glacier", "delete-archive", "--account-id=\(account)", "--vault-name=\(vault)", "--region=\(region)", "--archive-id=\(archiveID)"])
+    }
+
     public func uploadLegacyArchive(vault: String, region: String, file: URL, description requestedDescription: String? = nil,
                                     settings: UploadSettings = .init(), progress: (@Sendable (Double) -> Void)? = nil,
                                     status: (@Sendable (LegacyUploadStatus) -> Void)? = nil) async throws -> String {

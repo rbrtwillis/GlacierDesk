@@ -143,4 +143,17 @@ final class InventoryIndexTests: XCTestCase {
         XCTAssertEqual(page.folderCount, 200); XCTAssertEqual(page.folders.count, 100)
         XCTAssertEqual(page.page.totalCount, 0)
     }
+    func testConfirmedDeletionRemainsHiddenFromStaleInventoryAndOtherAccountsAreUnchanged() throws {
+        let (index, directory, scope) = try makeIndex()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archives = [IndexedGlacierArchive(archiveID: "deleted", description: "a"), IndexedGlacierArchive(archiveID: "kept", description: "b")]
+        try index.replaceInventory(scope: scope, archives: archives)
+        let other = GlacierInventoryScope(profile: scope.profile, accountID: "999999999999", region: scope.region, vault: scope.vault)
+        try index.replaceInventory(scope: other, archives: archives)
+        try index.recordDeletedArchive(scope: scope, archiveID: "deleted")
+        try index.replaceInventory(scope: scope, archives: archives)
+        XCTAssertEqual(try index.search(scope: scope).archives.map(\.archiveID), ["kept"])
+        XCTAssertEqual(Set(try index.search(scope: other).archives.map(\.archiveID)), ["deleted", "kept"])
+        XCTAssertEqual(try index.snapshot(scope: scope)?.archiveCount, 1)
+    }
 }

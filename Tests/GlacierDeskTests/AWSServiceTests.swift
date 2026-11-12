@@ -96,4 +96,25 @@ final class AWSServiceTests: XCTestCase {
         XCTAssertEqual(metadata.versionID, "-ver_123")
         try await service.deleteTestObject(bucket: "bucket", key: "test", versionID: metadata.versionID)
     }
+    func testLegacyDeletionPinsAccountVaultAndOpaqueArchiveID() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("fake-aws")
+        let script = #"""
+        #!/bin/sh
+        seen=0
+        for arg in "$@"; do
+          case "$arg" in
+            --account-id=123|--vault-name=vault|--region=us-west-2|--archive-id=-id_special) seen=$((seen+1)) ;;
+          esac
+        done
+        [ "$seen" = 4 ] || exit 1
+        printf '{}'
+        """#
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let service = AWSService(profile: "test", executableURL: executable)
+        try await service.deleteLegacyArchive(account: "123", vault: "vault", region: "us-west-2", archiveID: "-id_special")
+    }
 }

@@ -8,6 +8,16 @@ No changes recorded yet.
 
 ## 0.3.0 — 2026-11-11
 
+- Add reviewed permanent deletion for selected legacy archives and nested folders.
+
+- Organize legacy vault actions into Browse, Jobs, Uploads, and Retrieve sections.
+
+- Move the legacy inventory browser above job and upload history.
+
+- Navigate to the inventory browser after opening a job and collapse locally uploaded archive history.
+
+- Show the creation date and local time on legacy Glacier job entries.
+
 - Browse large legacy inventories through disk-backed, paged folder listings instead of retaining the full vault tree in memory.
 - Monitor opted-in vault inventories in the background while the app remains open and connected to the original account.
 - Show active file and part-task counts and aggregate AWS request timings for uploads; add an opt-in macOS network capacity test.
