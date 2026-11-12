@@ -9,6 +9,7 @@ struct UploadSpeedTestView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var sizeMiB = 16
     @State private var confirm = false
+    @State private var confirmNetwork = false
     @State private var running = false
     @State private var result: String?
     @State private var progress = 0.0
@@ -20,20 +21,38 @@ struct UploadSpeedTestView: View {
             Text("Destination: s3://\(bucket)/glacierdesk-throughput-tests/").textSelection(.enabled)
             Stepper("Test size: \(sizeMiB) MiB", value: $sizeMiB, in: 1...1024).disabled(running)
             Text("The test uploads a new STANDARD object with a unique name. AWS request, storage and transfer charges may apply. GlacierDesk attempts to delete the test object and its version when done. Cleanup requires read and delete permissions; incomplete multipart uploads may still need cleanup. A temporary file of the selected size is created on this Mac.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Text("This measures the AWS upload operation, including CLI setup; it is not a measurement of your network's maximum capacity.").font(.caption).foregroundStyle(.secondary)
+            Text("The S3 test includes CLI setup. The separate macOS capacity test uses an Internet test server; compare results as an estimate, not a guarantee of S3 performance.").font(.caption).foregroundStyle(.secondary)
             if running { ProgressView(value: progress) }
             if let result { Text(result).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 if running { Button("Cancel test") { worker?.cancel() } }
                 Spacer()
                 Button("Close") { dismiss() }.disabled(running)
-                Button("Review test…") { confirm = true }.disabled(running)
+                Button("Network capacity…") { confirmNetwork = true }.disabled(running)
+                Button("Review S3 test…") { confirm = true }.disabled(running)
             }
         }.padding(20).frame(width: 580)
+        .confirmationDialog("Run network capacity test?", isPresented: $confirmNetwork, titleVisibility: .visible) {
+            Button("Run upload-only test") { startNetworkTest() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("macOS networkQuality will upload data to its configured Internet test server for up to 30 seconds. It uses network bandwidth and may incur data charges. This is separate from an S3 upload test.") }
         .confirmationDialog("Upload test data to AWS?", isPresented: $confirm, titleVisibility: .visible) {
             Button("Upload \(sizeMiB) MiB test object") { start() }
             Button("Cancel", role: .cancel) {}
         } message: { Text("The test creates a billable S3 object in \(bucket), then attempts to delete it. Check the result and inspect incomplete uploads if necessary.") }
+    }
+
+    @MainActor private func startNetworkTest() {
+        guard !running else { return }
+        running = true; result = "Running macOS upload capacity test…"
+        worker = Task {
+            defer { running = false; worker = nil }
+            do {
+                let data = try await NetworkCapacityTest.run()
+                let measurement = try NetworkCapacityTest.parse(data)
+                result = "macOS measured \(String(format: "%.1f", measurement.bitsPerSecond / 1_000_000)) Mbps upload on \(measurement.interface). This test uses a different endpoint and protocol from S3; compare results as a diagnostic, not a guarantee."
+            } catch { result = "Network capacity test failed or was cancelled: \(error.localizedDescription)" }
+        }
     }
 
     @MainActor private func start() {

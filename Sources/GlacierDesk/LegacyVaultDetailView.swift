@@ -31,6 +31,8 @@ struct LegacyVaultDetailView: View {
     @State private var jobRefreshError: String?
     @State private var inventoryDate: String?
     @State private var inventoryFolders: LegacyInventoryFolders?
+    @State private var folderOffset = 0
+    @State private var folderCount = 0
     @State private var locallyAddedArchiveIDs = Set<String>()
     @State private var currentInventoryFolder = ""
     @State private var visibleInventoryFolders: [String] = []
@@ -38,6 +40,7 @@ struct LegacyVaultDetailView: View {
     @State private var inventoryIndexError: String?
     @State private var inventoryOffset = 0
     @State private var inventoryQueryToken = UUID()
+    @State private var inventoryLoadTask: Task<DiskFolderListing, Error>?
     @State private var cachedInventoryIndex: GlacierInventoryIndex?
     @State private var inventorySortChoice = "creationDate"
     @State private var inventoryAscending = false
@@ -56,7 +59,7 @@ struct LegacyVaultDetailView: View {
     @AppStorage("legacyJobNotificationsEnabled") private var jobNotificationsEnabled = false
     @AppStorage("legacyAutoCaptureInventory") private var autoCaptureInventory = false
     @AppStorage("legacyCapturedInventoryJobs") private var capturedJobsData = Data()
-    @State private var attemptedAutoCapture = Set<String>()
+    @ObservedObject private var captureCoordinator = InventoryCaptureCoordinator.shared
     @AppStorage("uploadThresholdMiB") private var uploadThresholdMiB = 64
     @AppStorage("uploadPartSizeMiB") private var uploadPartSizeMiB = 16
     @AppStorage("uploadConnections") private var uploadConnections = 4
@@ -149,10 +152,11 @@ struct LegacyVaultDetailView: View {
                 if let status { Text(status).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 Divider()
                 Text("Jobs").font(.headline)
-                Toggle("Automatically cache completed inventory jobs while this vault is open", isOn: $autoCaptureInventory)
+                Toggle("Automatically cache inventory jobs for vaults I open", isOn: $autoCaptureInventory)
                     .toggleStyle(.checkbox).font(.caption)
                     .onChange(of: autoCaptureInventory) { enabled in if enabled { Task { await captureCompletedInventoryIfEnabled() } } }
-                Text("Automatic capture downloads job output and may incur AWS charges. The cached snapshot remains on this Mac after AWS output expires.").font(.caption).foregroundStyle(.secondary)
+                Text("Automatic capture checks registered vaults while GlacierDesk is open and connected to the same account. Downloads may incur AWS charges. Cached snapshots remain on this Mac.").font(.caption).foregroundStyle(.secondary)
+                if let message = captureCoordinator.messages[monitoredVault.key] { Text(message).font(.caption).foregroundStyle(.secondary) }
                 Toggle("Notify me when a Glacier job finishes", isOn: $jobNotificationsEnabled)
                     .toggleStyle(.checkbox)
                     .font(.caption)
@@ -221,14 +225,17 @@ struct LegacyVaultDetailView: View {
                 HStack {
                     Button("← Parent folder") {
                         currentInventoryFolder = currentInventoryFolder.split(separator: "/").dropLast().joined(separator: "/")
-                        inventoryOffset = 0; Task { await loadInventoryPage() }
+                        inventoryOffset = 0; folderOffset = 0; Task { await loadInventoryPage() }
                     }.disabled(currentInventoryFolder.isEmpty)
-                    Button("Vault root") { currentInventoryFolder = ""; inventoryOffset = 0; Task { await loadInventoryPage() } }
+                    Button("Vault root") { currentInventoryFolder = ""; inventoryOffset = 0; folderOffset = 0; Task { await loadInventoryPage() } }
                         .disabled(currentInventoryFolder.isEmpty)
                     Text(currentInventoryFolder.isEmpty ? "/" : "/" + currentInventoryFolder).textSelection(.enabled)
                 }
-                TextField("Search current folder", text: $search).textFieldStyle(.roundedBorder)
-                    .onChange(of: search) { _ in inventoryOffset = 0; Task { await loadInventoryPage() } }
+                HStack {
+                    TextField("Search current folder", text: $search).textFieldStyle(.roundedBorder)
+                        .onSubmit { inventoryOffset = 0; folderOffset = 0; Task { await loadInventoryPage() } }
+                    Button("Search") { inventoryOffset = 0; folderOffset = 0; Task { await loadInventoryPage() } }
+                }
                 HStack {
                     Picker("Sort", selection: $inventorySortChoice) {
                         Text("Date").tag("creationDate"); Text("Name").tag("description")
@@ -242,9 +249,16 @@ struct LegacyVaultDetailView: View {
                 ForEach(visibleInventoryFolders, id: \.self) { folder in
                     Button {
                         currentInventoryFolder = currentInventoryFolder.isEmpty ? folder : currentInventoryFolder + "/" + folder
-                        search = ""; inventoryOffset = 0; Task { await loadInventoryPage() }
+                        search = ""; inventoryOffset = 0; folderOffset = 0; Task { await loadInventoryPage() }
                     } label: { Label(folder, systemImage: "folder.fill").frame(maxWidth: .infinity, alignment: .leading) }
                         .buttonStyle(.plain).padding(.vertical, 5)
+                }
+                if folderCount > inventoryPageSize {
+                    HStack {
+                        Button("Previous folders") { folderOffset = max(0, folderOffset - inventoryPageSize); Task { await loadInventoryPage() } }.disabled(folderOffset == 0)
+                        Text("Folders \(folderOffset + 1)–\(min(folderOffset + visibleInventoryFolders.count, folderCount)) of \(folderCount)").font(.caption).foregroundStyle(.secondary)
+                        Button("Next folders") { folderOffset += inventoryPageSize; Task { await loadInventoryPage() } }.disabled(folderOffset + visibleInventoryFolders.count >= folderCount)
+                    }
                 }
                 ForEach(visibleArchives) { archive in
                     VStack(alignment: .leading, spacing: 4) {
@@ -278,8 +292,11 @@ struct LegacyVaultDetailView: View {
             }.padding(20).frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: acceptDrop)
+        .onReceive(NotificationCenter.default.publisher(for: .legacyInventoryCaptured)) { notification in
+            if notification.object as? String == monitoredVault.key { inventoryFolders = nil; Task { await restoreCachedInventory() } }
+        }
         .onChange(of: busy) { externalBusy = $0 }
-        .onDisappear { externalBusy = false }
+        .onDisappear { externalBusy = false; inventoryLoadTask?.cancel() }
         .sheet(isPresented: $showFolderReview, onDismiss: {
             releaseFolderScopes()
             if openQueueAfterReview { openQueueAfterReview = false; showTransferHistory = true }
@@ -330,7 +347,7 @@ struct LegacyVaultDetailView: View {
                         TimelineView(.periodic(from: .now, by: 1)) { timeline in
                             let bytes = uploadBytesByItem.values.reduce(Int64(0), +)
                             let elapsed = max(1, timeline.date.timeIntervalSince(started))
-                            Text("Confirmed transferred: \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .binary)) · average \(ByteCountFormatter.string(fromByteCount: Int64(Double(bytes) / elapsed), countStyle: .binary))/s · \(Int(elapsed)) s elapsed")
+                            Text("\(uploadQueue.filter { $0.state.hasPrefix("Uploading") || $0.state.hasPrefix("Preparing") }.count) active files · Confirmed transferred: \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .binary)) · average \(ByteCountFormatter.string(fromByteCount: Int64(Double(bytes) / elapsed), countStyle: .binary))/s · \(Int(elapsed)) s elapsed")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -514,19 +531,12 @@ struct LegacyVaultDetailView: View {
             status = nil
         } catch { status = "S3 listing or comparison failed: \(error.localizedDescription)" }
     }
+    private var monitoredVault: MonitoredVault { MonitoredVault(profile: profile, account: accountID, region: region, vault: vault.vaultName) }
+
     @MainActor private func captureCompletedInventoryIfEnabled() async {
-        guard autoCaptureInventory, !busy else { return }
-        let scopeKey = [profile, accountID, region, vault.vaultName].joined(separator: "\u{0}")
-        let captured = (try? JSONDecoder().decode([String: String].self, from: capturedJobsData)) ?? [:]
-        guard let job = jobs.filter({ $0.action == "InventoryRetrieval" && $0.statusCode == "Succeeded" && $0.creationDate != nil }).max(by: { ($0.creationDate ?? "") < ($1.creationDate ?? "") }),
-              captured[scopeKey] != job.jobId, !attemptedAutoCapture.contains(job.jobId) else { return }
-        if let date = inventoryDate, date != "Unknown", let created = job.creationDate, created < date { return }
-        attemptedAutoCapture.insert(job.jobId)
-        await openInventory(job)
-        if status == "Inventory loaded and indexed." {
-            var updated = captured; updated[scopeKey] = job.jobId
-            if let data = try? JSONEncoder().encode(updated) { capturedJobsData = data }
-        } else { jobRefreshError = "Automatic inventory capture failed. Use Open inventory to retry: \(status ?? "Unknown error")" }
+        guard autoCaptureInventory else { return }
+        captureCoordinator.register(monitoredVault)
+        await captureCoordinator.poll(profile: profile, account: accountID)
     }
 
     @MainActor private func requestInventory() async {
@@ -584,24 +594,20 @@ struct LegacyVaultDetailView: View {
         let scope = inventoryScope, query = search, offset = inventoryOffset, size = inventoryPageSize
         let sort = selectedInventorySort, ascending = inventoryAscending
         do {
-            let existing = inventoryFolders, folder = currentInventoryFolder, existingLocal = locallyAddedArchiveIDs
+            let folder = currentInventoryFolder, folderPage = folderOffset
             let locallySaved = ((try? JSONDecoder().decode([SavedLegacyUpload].self, from: uploadedData)) ?? []).filter { $0.profile == profile && $0.accountID == accountID && $0.region == region && $0.vault == vault.vaultName }.map { IndexedGlacierArchive(archiveID: $0.id, description: String($0.filename.unicodeScalars.map { (32...126).contains($0.value) ? Character($0) : "_" }.prefix(1024))) }
-            let result = try await Task.detached(priority: .utility) {
-                var tree = existing ?? LegacyInventoryFolders()
-                var localIDs = existingLocal
-                if existing == nil {
-                    var savedByID = Dictionary(locallySaved.map { ($0.archiveID, $0) }, uniquingKeysWith: { first, _ in first })
-                    try index.forEachArchive(scope: scope) { archive in tree.add(archive); savedByID.removeValue(forKey: archive.archiveID) }
-                    localIDs = Set(savedByID.keys)
-                    for archive in savedByID.values { tree.add(archive) }
-                }
-                return (tree, tree.listing(folder: folder, search: query, offset: offset, pageSize: size, sort: sort, ascending: ascending), localIDs)
-            }.value
+            inventoryLoadTask?.cancel()
+            let task = Task.detached(priority: .utility) {
+                try index.browseFolder(scope: scope, folder: folder, search: query, offset: offset, folderOffset: folderPage,
+                    pageSize: size, sort: sort, ascending: ascending, locallySaved: locallySaved)
+            }
+            inventoryLoadTask = task
+            let result = try await task.value
             guard inventoryQueryToken == token else { return }
-            inventoryFolders = result.0
-            locallyAddedArchiveIDs = result.2
-            visibleInventoryFolders = result.1.folders
-            inventoryPage = result.1.page
+            locallyAddedArchiveIDs = result.localIDs
+            visibleInventoryFolders = result.folders
+            folderCount = result.folderCount
+            inventoryPage = result.page
             inventoryIndexError = nil
         } catch { guard inventoryQueryToken == token else { return }; inventoryIndexError = error.localizedDescription; inventoryPage = nil }
     }
@@ -906,7 +912,8 @@ struct LegacyVaultDetailView: View {
                                                settings: UploadSettings, queue: DurableTransferQueue, service: AWSService) async -> Int {
         let limit = min(16, max(1, legacyParallelFiles)), total = items.count
         uploadStartedAt = Date(); uploadBytesByItem = [:]; uploadTimeByItem = [:]; uploadChecksumStart = [:]; uploadStageSummary = [:]
-        var next = 0, finished = 0, succeeded = 0, failures = 0, stopScheduling = false
+        var scheduler = UploadScheduler(total: total, limit: limit)
+        var finished = 0, succeeded = 0, failures = 0, stopScheduling = false
         status = "Uploading up to \(limit) files at once · up to \(settings.connections) multipart requests per file"
         await withTaskGroup(of: (Bool, Bool).self) { group in
             func schedule(_ index: Int) {
@@ -914,8 +921,9 @@ struct LegacyVaultDetailView: View {
                     await uploadLegacyQueueItem(index: index, item: items[index], record: records[index], sessionID: sessionID, settings: settings, queue: queue, service: service)
                 }
             }
-            while next < min(limit, total) { schedule(next); next += 1 }
+            while let index = scheduler.takeNext() { schedule(index) }
             while let (success, uncertain) = await group.next() {
+                scheduler.finishOne()
                 finished += 1
                 if success { succeeded += 1 } else { failures += 1 }
                 if uncertain { stopScheduling = true }
@@ -923,7 +931,8 @@ struct LegacyVaultDetailView: View {
                 status = "\(finished) of \(total) processed · \(succeeded) uploaded · \(failures) failed or cancelled"
                 if Task.isCancelled { group.cancelAll(); stopScheduling = true }
                 if stopRequested { stopScheduling = true }
-                if !stopScheduling && next < total { schedule(next); next += 1 }
+                if stopScheduling { scheduler.stop() }
+                if let index = scheduler.takeNext() { schedule(index) }
             }
         }
         if Task.isCancelled { status = "Transfers stopped. Pending files remain queued; review uncertain results." }
@@ -965,7 +974,7 @@ struct LegacyVaultDetailView: View {
                         uploadStageSummary[item.id, default: ""] += " · checksum \(String(format: "%.1f", hashTime))s"
                         uploadChecksumStart[item.id] = nil
                     }
-                    if case let .multipart(_, _, _, _, bytes) = update { uploadBytesByItem[item.id] = bytes }
+                    if case let .multipart(_, _, _, _, bytes, _, _) = update { uploadBytesByItem[item.id] = bytes }
                     let elapsed = max(1, Date().timeIntervalSince(uploadTimeByItem[item.id] ?? Date()))
                     let bytes = uploadBytesByItem[item.id] ?? 0
                     uploadQueue[index].state = "Uploading · " + Self.describeUpload(update) + " · avg \(ByteCountFormatter.string(fromByteCount: Int64(Double(bytes) / elapsed), countStyle: .binary))/s (including preparation) · " + (uploadStageSummary[item.id] ?? "")
@@ -1018,8 +1027,8 @@ struct LegacyVaultDetailView: View {
         switch status {
         case .preparing(let multipart): return "\(multipart ? "Multipart" : "Single request") · calculating checksum…"
         case .singleRequest: return "Single request · uploading (part progress not available)"
-        case let .multipart(completed, total, partSize, connections, _):
-            return "Multipart · \(completed) of \(total) parts complete · \(ByteCountFormatter.string(fromByteCount: partSize, countStyle: .binary)) per part · up to \(connections) parallel requests"
+        case let .multipart(completed, total, partSize, connections, _, active, requestSeconds):
+            return "Multipart · \(completed) of \(total) parts complete · \(active) part tasks active (limit \(connections)) · \(ByteCountFormatter.string(fromByteCount: partSize, countStyle: .binary)) per part · \(String(format: "%.1f", requestSeconds))s summed AWS request time"
         case .completing: return "Multipart · all parts uploaded; confirming archive with AWS…"
         }
     }

@@ -59,7 +59,7 @@ final class AWSServiceTests: XCTestCase {
         let collector = UploadStatusCollector()
         let id = try await service.uploadLegacyArchive(vault: "v", region: "us-west-2", file: file, description: "file", settings: settings, status: { collector.append($0) })
         XCTAssertEqual(id, "ok")
-        XCTAssertTrue(collector.all().contains { if case .multipart(completed: 1, total: 1, partSize: _, connections: 1, bytes: 1_048_576) = $0 { return true }; return false })
+        XCTAssertTrue(collector.all().contains { if case .multipart(completed: 1, total: 1, partSize: _, connections: 1, bytes: 1_048_576, active: 0, requestSeconds: _) = $0 { return true }; return false })
         try Data().write(to: root.appendingPathComponent("fail"))
         do {
             _ = try await service.uploadLegacyArchive(vault: "v", region: "us-west-2", file: file, description: "file", settings: settings)

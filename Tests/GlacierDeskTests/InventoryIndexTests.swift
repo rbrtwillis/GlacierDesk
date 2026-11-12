@@ -119,4 +119,28 @@ final class InventoryIndexTests: XCTestCase {
         XCTAssertThrowsError(try index.importInventoryJSON(at: file, scope: scope))
         XCTAssertEqual(try index.search(scope: scope).archives.map(\.archiveID), ["new"])
     }
+    func testDiskFolderBrowsingPagesAndReconcilesLocalUploads() throws {
+        let (index, directory, scope) = try makeIndex()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archives = (0..<5000).map { IndexedGlacierArchive(archiveID: "a\($0)", description: "folder\($0 % 120)/file\($0).jpg", size: Int64($0)) }
+        try index.replaceInventory(scope: scope, archives: archives)
+        let local = [IndexedGlacierArchive(archiveID: "new", description: "folder0/local.jpg"), IndexedGlacierArchive(archiveID: "a0", description: "duplicate")]
+        let root = try index.browseFolder(scope: scope, folder: "", search: "", offset: 0, folderOffset: 0, pageSize: 50, sort: .description, ascending: true, locallySaved: local)
+        XCTAssertEqual(root.folderCount, 120); XCTAssertEqual(root.folders.count, 50)
+        XCTAssertEqual(root.localIDs, ["new"])
+        let next = try index.browseFolder(scope: scope, folder: "", search: "", offset: 0, folderOffset: 100, pageSize: 50, sort: .description, ascending: true, locallySaved: local)
+        XCTAssertEqual(next.folders.count, 20)
+        let match = try index.browseFolder(scope: scope, folder: "folder0", search: "local", offset: 0, folderOffset: 0, pageSize: 50, sort: .description, ascending: true, locallySaved: local)
+        XCTAssertEqual(match.page.archives.map(\.archiveID), ["new"])
+        XCTAssertEqual(match.page.totalCount, 1)
+    }
+    func testDiskFolderBrowsingLargeSyntheticVault() throws {
+        let (index, directory, scope) = try makeIndex()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archives = (0..<100_000).lazy.map { IndexedGlacierArchive(archiveID: "large\($0)", description: "year\($0 % 200)/file\($0).jpg") }
+        try index.replaceInventory(scope: scope, archives: archives)
+        let page = try index.browseFolder(scope: scope, folder: "", search: "", offset: 0, folderOffset: 100, pageSize: 100, sort: .description, ascending: true, locallySaved: [])
+        XCTAssertEqual(page.folderCount, 200); XCTAssertEqual(page.folders.count, 100)
+        XCTAssertEqual(page.page.totalCount, 0)
+    }
 }

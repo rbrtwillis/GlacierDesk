@@ -4,7 +4,7 @@ import CryptoKit
 public enum LegacyUploadStatus: Sendable {
     case preparing(multipart: Bool)
     case singleRequest
-    case multipart(completed: Int, total: Int, partSize: Int64, connections: Int, bytes: Int64)
+    case multipart(completed: Int, total: Int, partSize: Int64, connections: Int, bytes: Int64, active: Int, requestSeconds: Double)
     case completing
 }
 
@@ -133,7 +133,7 @@ public struct AWSService: Sendable {
         while partSize < required && partSize < 4096 * mib { partSize *= 2 }
         guard partSize >= required else { throw AWSServiceError.commandFailed("Archive or part size exceeds Glacier multipart limits (maximum 4 GiB per part and 10,000 parts).") }
         let partCount = Int((total + partSize - 1) / partSize)
-        status?(.multipart(completed: 0, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: 0))
+        status?(.multipart(completed: 0, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: 0, active: 0, requestSeconds: 0))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -145,9 +145,10 @@ public struct AWSService: Sendable {
             throw AWSServiceError.commandFailed("Could not confirm multipart initiation. An incomplete upload may exist without a known ID; inspect Glacier multipart uploads before retrying. \(error.localizedDescription)")
         }
         do {
-            try await withThrowingTaskGroup(of: Int64.self) { group in
+            try await withThrowingTaskGroup(of: (Int64, Double).self) { group in
                 var next = 0, completed = 0
                 var completedBytes: Int64 = 0
+                var requestSeconds: Double = 0
                 func addPart(_ index: Int) {
                     group.addTask {
                         let offset = Int64(index) * partSize, length = min(partSize, total - offset)
@@ -155,16 +156,18 @@ public struct AWSService: Sendable {
                         defer { try? FileManager.default.removeItem(at: part) }
                         try writeLegacyPart(source: file, destination: part, offset: offset, length: length)
                         let partHash = try glacierTreeHash(part)
+                        let requestStart = Date()
                         _ = try await run(["glacier", "upload-multipart-part", "--account-id", "-", "--vault-name", vault, "--region", region, "--upload-id=\(uploadId)", "--range", "bytes \(offset)-\(offset + length - 1)/*", "--checksum", partHash, "--body", part.path])
-                        return length
+                        return (length, Date().timeIntervalSince(requestStart))
                     }
                 }
                 while next < min(partCount, settings.connections) { addPart(next); next += 1 }
-                while let length = try await group.next() {
-                    completedBytes += length
+                status?(.multipart(completed: 0, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: 0, active: next, requestSeconds: 0))
+                while let (length, seconds) = try await group.next() {
+                    completedBytes += length; requestSeconds += seconds
                     completed += 1; progress?(Double(completed) / Double(partCount))
-                    status?(.multipart(completed: completed, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: completedBytes))
                     if next < partCount { addPart(next); next += 1 }
+                    status?(.multipart(completed: completed, total: partCount, partSize: partSize, connections: min(settings.connections, partCount), bytes: completedBytes, active: next - completed, requestSeconds: requestSeconds))
                 }
             }
         } catch {

@@ -458,6 +458,9 @@ struct ContentView: View {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
                 guard !Task.isCancelled else { break }
                 await model.refreshRestores()
+                if let profile = model.connectedProfile, let account = model.identity?.account {
+                    await InventoryCaptureCoordinator.shared.poll(profile: profile, account: account)
+                }
             }
         }
         .fileImporter(isPresented: $showUpload, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in

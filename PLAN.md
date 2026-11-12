@@ -29,9 +29,9 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 ### Implementation status
 
-- Implemented: opt-in inventory capture while the vault is open, persistent local snapshots, and protection against replacing a newer dated snapshot with an older one. Large-vault memory use, background capture, and broader browser scalability remain to be addressed.
-- Implemented: confirmed-part byte counts, average upload rates, snapshot/checksum timing, and an opt-in S3 upload test. The test attempts to delete its object and identified version and reports unconfirmed cleanup; separate network-capacity measurement, active-request counts, detailed AWS wait timing, and tuning recommendations remain open.
-- Implemented: graceful stop and separate immediate cancellation, plus reviewed clearing of selected uncertain local records. Dedicated concurrent stop/resume integration coverage and live AWS validation remain open.
+- Implemented: disk-backed paged folder listings, opt-in capture across registered vaults while the app is open and connected, persistent local snapshots, and protection against replacement by older dated snapshots. Navigation scans the cached inventory and uses temporary disk space; live large-vault performance still requires validation.
+- Implemented: active file and part-task counts, confirmed-part byte counts, average rates, snapshot/checksum and summed AWS request timings, and an opt-in S3 upload test with attempted version-aware cleanup. An opt-in macOS networkQuality test measures upload capacity to its configured Internet endpoint; it does not guarantee S3 performance. The README provides conditional tuning guidance; live testing and automatic bottleneck identification remain open.
+- Implemented: graceful stop and separate immediate cancellation, plus reviewed clearing of selected uncertain local records. Simulated concurrent stop/resume and durable-queue restart coverage has been added; live AWS validation remains open.
 
 ## Next milestones
 
