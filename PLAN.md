@@ -17,23 +17,19 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 - For upload settings, the app creates a private temporary copy of the AWS config and removes it after the transfer. The app does not intentionally save credentials in preferences or restore history.
 - Diagnostic redaction and credential isolation require further security review and testing. Use least-privilege IAM permissions and a dedicated test bucket for evaluation.
 
-## Queue follow-up
+## Transfer and inventory to-do
 
-- [ ] Show how much remains in the legacy transfer queue: total and remaining file counts and bytes, distinguishing pending files from active uploads. Account for confirmed multipart progress without double-counting completed files, handle unknown sizes and failed, cancelled, or uncertain outcomes explicitly, and update the figures correctly after stop, retry, resume, and restart. Include tests for mixed sizes and states.
+- [ ] Show total and remaining upload files and bytes, separating pending and active work. Account for confirmed multipart progress without double-counting; handle unknown sizes, failed, cancelled, and uncertain outcomes across stop, retry, resume, and restart. Test mixed sizes and states.
+- [ ] Resume multipart uploads from confirmed completed parts after interruption, with account and source verification, safe recovery, and cleanup of abandoned uploads. Current retries restart a file.
+- [ ] Validate graceful stop, immediate cancellation, explicit resume, and reviewed clearing of uncertain records against realistic concurrent failures and restarts; improve guidance for inspecting and cleaning up uncertain AWS uploads.
+- [ ] Validate inventory capture, caching, local-upload reconciliation, expiration handling, and browsing performance with large vaults. Improve snapshot freshness and navigation as needed without presenting stale data as a live AWS listing. Background capture currently runs only while the app is open and connected.
+- [ ] Validate throughput measurements and speed-test cleanup; improve bottleneck identification and tuning guidance. Distinguish S3 throughput from the separate macOS network-capacity test and account for request, storage, data-transfer, and temporary-disk costs.
 
-- [ ] Improve legacy vault inventory freshness, retention, and browser scalability. Investigate AWS Glacier inventory generation and completed-job output retention limits, document which limits AWS controls, and ensure the locally indexed snapshot remains available beyond the AWS job-output window. Design an opt-in, cost-aware way to capture completed inventory jobs before their output expires and to reconcile confirmed local uploads or other known changes without representing the snapshot as a live AWS listing. Review large-vault indexing, folder navigation, search, pagination, and responsiveness; clearly show snapshot age, local additions, failures, and when a new AWS inventory is needed. Add tests for cache persistence, reconciliation, large inventories, and expired job output.
+### Already implemented
 
-- [ ] Add upload throughput diagnostics and a way to assess available network capacity. Show aggregate and per-file transfer rates, bytes and elapsed time, active files and multipart requests, and time spent preparing snapshots, checksumming, and waiting on AWS. Offer an explicitly started, cost-aware throughput test with a user-selected destination and data size; distinguish measured end-to-end AWS upload speed from local network capacity and avoid claiming a theoretical maximum. Use the measurements to identify likely bottlenecks and help tune file concurrency, part size, and per-file connections. Document test costs, temporary storage use, and cleanup, and test calculations with simulated transfers.
-
-- [ ] Make **Stop** a graceful queue stop: do not start any additional files, allow each active file to finish uploading its remaining parts and complete normally, then leave never-started files pending for explicit resume. Keep a separate clearly labeled immediate cancellation action if interrupting active transfers is needed. Test concurrent uploads, stop/resume, errors, and queue persistence across restart.
-
-- [ ] Allow an operator to review and clear selected legacy upload records marked `outcomeUnknown` from the local transfer queue. Show the archive path and known multipart upload ID, explain that clearing the local record does not abort or delete anything in AWS, and require an explicit acknowledgement before removing the record. Preserve the existing restriction against automatic retry of uncertain uploads; offer guidance for inspecting and cleaning up an incomplete multipart upload in the correct account, Region, and vault. Include individual and bulk selection tests and verify that other queue entries are unaffected.
-
-### Implementation status
-
-- Implemented: disk-backed paged folder listings, opt-in capture across registered vaults while the app is open and connected, persistent local snapshots, and protection against replacement by older dated snapshots. Navigation scans the cached inventory and uses temporary disk space; live large-vault performance still requires validation.
-- Implemented: active file and part-task counts, confirmed-part byte counts, average rates, snapshot/checksum and summed AWS request timings, and an opt-in S3 upload test with attempted version-aware cleanup. An opt-in macOS networkQuality test measures upload capacity to its configured Internet endpoint; it does not guarantee S3 performance. The README provides conditional tuning guidance; live testing and automatic bottleneck identification remain open.
-- Implemented: graceful stop and separate immediate cancellation, plus reviewed clearing of selected uncertain local records. Simulated concurrent stop/resume and durable-queue restart coverage has been added; live AWS validation remains open.
+- Disk-backed paged folder listings, local inventory snapshots, opt-in capture while the app is open, local upload reconciliation, and protection against replacing newer snapshots with older ones.
+- Active file and part-task counts, confirmed bytes, transfer rates, snapshot/checksum and AWS request timing, an opt-in S3 test with attempted version-aware cleanup, and an opt-in macOS network capacity test.
+- Graceful stop, separate immediate cancellation, explicit retry of eligible files, and reviewed clearing of selected uncertain local records. Simulated concurrency, restart, inventory, and account-scope tests exist; live AWS validation remains outstanding.
 
 ## Later S3 interface work
 
@@ -43,13 +39,13 @@ The lifecycle workflow previews all rules and checks for intervening changes bef
 
 - [ ] Add a WORM protection workflow for legacy Glacier vaults using AWS Vault Lock policies. Allow users to inspect the current lock state, configure and preview a retention policy that enforces the intended write-once/read-many restrictions, and review the account, Region, vault, retention period, and affected operations. Support the separate initiation and completion steps, explain the 24-hour initiation window, and make the permanent, irreversible effect of completing a lock unmistakable before explicit confirmation. Handle existing locks, failed or expired initiation, permissions, and policy validation; test with simulated AWS responses without locking a live vault.
 
-## Next milestones
+## Validation and release to-do
 
-1. Validate browse, upload, download, restore, and lifecycle flows against a dedicated AWS account and bucket, including permissions, SSO expiration, interruptions, and cost behavior.
-2. Add automated integration and unit tests, including redaction, profile isolation, lifecycle preservation, concurrency, transfer cancellation, and restore status across restarts.
-3. Improve transfers with durable queueing, robust recovery, resumable multipart operations and cleanup, and clearer progress and errors.
-4. Improve restores with configurable duration, clearer expiration and status, recovery after interrupted submissions, and discovery or import of externally initiated requests.
-5. Complete accessibility and light/dark appearance review, security review, dependency and secret scanning, CI, signing, notarization, and distribution.
+- [ ] Validate browsing, upload, download, restore, lifecycle rules, and legacy vault workflows in a specifically authorized AWS test account and bucket, including permission failures, expired SSO sessions, interruptions, and costs.
+- [ ] Expand automated integration and unit tests for redaction, profile and account isolation, lifecycle preservation, transfer concurrency and cancellation, restore status, and recovery across restarts.
+- [ ] Improve restores with configurable duration, expiration and status, recovery after interrupted submissions, and discovery or import of requests initiated elsewhere.
+- [ ] Complete security, dependency, and secret-scanning reviews; verify CI, accessibility, and light/dark appearance.
+- [ ] Complete code signing, notarization, and a distribution process.
 
 Use a dedicated test account and bucket with narrowly scoped permissions and an explicit budget. Verify a complete upload → restore → download flow and file integrity before treating 0.3 as production-ready.
 
